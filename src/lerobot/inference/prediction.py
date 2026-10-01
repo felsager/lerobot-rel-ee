@@ -24,8 +24,13 @@ from typing import Any, Protocol, cast
 
 import torch
 
-from lerobot.policies import PreTrainedPolicy, reanchor_relative_rtc_prefix
-from lerobot.processor import NormalizerProcessorStep, PolicyProcessorPipeline, RelativeActionsProcessorStep
+from lerobot.policies import PreTrainedPolicy, reanchor_relative_ee_rtc_prefix, reanchor_relative_rtc_prefix
+from lerobot.processor import (
+    NormalizerProcessorStep,
+    PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
+    RelativeEEActionsStep,
+)
 
 from .contracts import ChunkPolicySpec, ExecutionMode
 
@@ -72,10 +77,12 @@ def _prepare_continuation(
     horizon: int,
     device: str | torch.device,
     relative_step: RelativeActionsProcessorStep | None,
+    relative_ee_step: RelativeEEActionsStep | None,
     normalizer_step: NormalizerProcessorStep | None,
 ) -> torch.Tensor | None:
     if model is None or model.numel() == 0:
         return None
+
     if (
         model.ndim != 2
         or model.shape[1] != model_action_dim
@@ -83,14 +90,27 @@ def _prepare_continuation(
         or not torch.isfinite(model).all()
     ):
         raise ValueError("Invalid model-space continuation.")
-    if relative_step is not None:
+
+    if relative_ee_step is not None:
+        if canonical is None or canonical.shape != (model.shape[0], 8) or not torch.isfinite(canonical).all():
+            raise ValueError("Relative EE RTC requires matching finite canonical continuation shaped [T, 8].")
+        state = relative_ee_step.get_cached_state()
+        if state is None:
+            raise ValueError("Relative EE RTC preprocessor did not cache the current raw state.")
+        reanchored = reanchor_relative_ee_rtc_prefix(canonical, state, normalizer_step, device)
+        if reanchored.shape != model.shape:
+            raise ValueError("Re-anchored EE continuation must match the model action shape.")
+        model = reanchored
+    elif relative_step is not None:
         if canonical is None or canonical.shape != model.shape or not torch.isfinite(canonical).all():
             raise ValueError("Relative RTC requires matching finite canonical continuation.")
         state = relative_step.get_cached_state()
         if state is None:
             raise ValueError("Relative RTC preprocessor did not cache the current raw state.")
         model = reanchor_relative_rtc_prefix(canonical, state, relative_step, normalizer_step, device)
+
     model = model.to(device)
+
     if len(model) < horizon:
         # Zero in normalized coordinates decodes to the dataset mean, not hold.
         model = torch.cat([model, model[-1:].expand(horizon - len(model), -1)])
@@ -112,6 +132,7 @@ def predict_chunk(
     model_continuation: torch.Tensor | None = None,
     canonical_continuation: torch.Tensor | None = None,
     relative_step: RelativeActionsProcessorStep | None = None,
+    relative_ee_step: RelativeEEActionsStep | None = None,
     normalizer_step: NormalizerProcessorStep | None = None,
 ) -> ChunkPrediction:
     """Predict and validate under exclusive policy/processor ownership.
@@ -130,6 +151,7 @@ def predict_chunk(
                 horizon=rtc_horizon,
                 device=device,
                 relative_step=relative_step,
+                relative_ee_step=relative_ee_step,
                 normalizer_step=normalizer_step,
             )
             if inference_delay < 0:

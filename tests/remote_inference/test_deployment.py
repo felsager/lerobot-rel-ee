@@ -23,12 +23,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.inference import ExecutionMode, FeatureSpec
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.processor import (
+    AbsoluteEEActionsStep,
+    DeviceProcessorStep,
+    EEStateStep,
+    RelativeEEActionsStep,
+    RenameObservationsProcessorStep,
+)
+from lerobot.processor.factory import make_policy_processor_pipelines
 from lerobot.remote_inference import deployment as serving
 from lerobot.remote_inference.configs import ExecutionConfig, ModelConfig, ServerConfig
 from lerobot.transport.zenoh import ZenohConfig
+from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.inference.policy_helpers import ConformingPolicy, observation, processors, tiny_config
 
 
@@ -66,6 +76,40 @@ def test_server_loads_saved_act_and_processors_warms_and_resets(deployment):
     assert changed.capabilities.execution_steps == 3
     _, debug_identity = serving.load_deployment(replace(deployment, log_level="DEBUG"))
     assert debug_identity == identity, "console verbosity must not invalidate a pinned artifact"
+
+
+def test_relative_ee_warmup_uses_valid_reference_pose(deployment: ServerConfig, tmp_path: Path) -> None:
+    config = tiny_config()
+    config.input_features[OBS_STATE] = PolicyFeature(FeatureType.STATE, (10,))
+    config.output_features[ACTION] = PolicyFeature(FeatureType.ACTION, (10,))
+    checkpoint = tmp_path / "ee_checkpoint"
+    ACTPolicy(config).save_pretrained(checkpoint)
+    relative = RelativeEEActionsStep()
+    pre, post = make_policy_processor_pipelines(
+        input_steps=[
+            RenameObservationsProcessorStep(rename_map={}),
+            DeviceProcessorStep(device="cpu"),
+            relative,
+            EEStateStep(),
+        ],
+        output_steps=[AbsoluteEEActionsStep(relative_step=relative)],
+    )
+    pre.save_pretrained(checkpoint)
+    post.save_pretrained(checkpoint)
+    requested = replace(
+        deployment,
+        model=replace(deployment.model, repo_or_path=str(checkpoint)),
+        features=[
+            replace(feature, shape=(8,)) if feature.name == OBS_STATE else feature
+            for feature in deployment.features
+        ],
+        action_feature=FeatureSpec(ACTION, (8,), "float32", semantics="xyz, quaternion xyzw, gripper"),
+    )
+
+    runner, _ = serving.load_deployment(requested)
+
+    assert runner._relative_ee_step.get_cached_state() is None
+    assert not runner.policy._action_queue
 
 
 def test_identical_checkpoint_pin_survives_host_path_and_transport_changes(deployment, tmp_path):

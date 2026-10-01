@@ -1,0 +1,308 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import roma
+import torch
+
+from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
+from lerobot.processor import TransitionKey, batch_to_transition
+from lerobot.processor.relative_action_processor import bind_relative_anchor
+from lerobot.processor.relative_ee_action_processor import (
+    AbsoluteEEActionsStep,
+    EEStateStep,
+    RelativeEEActionsStep,
+    ee_to_rot6d,
+    quat_to_rotmat,
+    rot6d_to_rotmat,
+    to_absolute_ee_actions,
+    to_relative_ee_actions,
+)
+from lerobot.utils.constants import ACTION, OBS_STATE
+
+
+def _random_ee(*shape: int) -> torch.Tensor:
+    """Random 8D EE vectors [x, y, z, qx, qy, qz, qw, gripper]."""
+    return torch.cat(
+        [torch.randn(*shape, 3) * 0.3, roma.random_unitquat(shape), torch.rand(*shape, 1)], dim=-1
+    )
+
+
+def _gripper_down_ee(*shape: int) -> torch.Tensor:
+    """8D EE vectors with the tool z-axis pointing straight down (a 180 deg rotation), random q/-q signs."""
+    psi = torch.rand(shape) * 2 * torch.pi
+    zeros = torch.zeros(shape)
+    quat = torch.stack([torch.cos(psi / 2), torch.sin(psi / 2), zeros, zeros], dim=-1)
+    sign = torch.where(torch.rand(*shape, 1) < 0.5, -1.0, 1.0)
+    return torch.cat([torch.randn(*shape, 3) * 0.3, sign * quat, torch.rand(*shape, 1)], dim=-1)
+
+
+def _assert_same_ee(actual: torch.Tensor, expected: torch.Tensor, atol: float = 1e-5) -> None:
+    """Positions and grippers compared directly, rotations by angle (q and -q are the same rotation)."""
+    torch.testing.assert_close(actual[..., :3], expected[..., :3], atol=atol, rtol=0)
+    torch.testing.assert_close(actual[..., 7:], expected[..., 7:], atol=atol, rtol=0)
+    angle = roma.rotmat_geodesic_distance(
+        quat_to_rotmat(actual[..., 3:7]), quat_to_rotmat(expected[..., 3:7])
+    )
+    assert angle.max() < atol, f"max rotation error {angle.max():.2e} rad"
+
+
+def _homogeneous(ee: torch.Tensor) -> torch.Tensor:
+    """8D EE vectors -> 4x4 homogeneous transforms in float64 (gripper dropped)."""
+    ee = ee.double()
+    transform = torch.eye(4, dtype=torch.float64).expand(*ee.shape[:-1], 4, 4).clone()
+    transform[..., :3, :3] = quat_to_rotmat(ee[..., 3:7])
+    transform[..., :3, 3] = ee[..., :3]
+    return transform
+
+
+# ---------------------------------------------------------------------------
+# Conversion functions
+# ---------------------------------------------------------------------------
+
+
+def test_relative_ee_roundtrip_chunk():
+    torch.manual_seed(0)
+    state, actions = _random_ee(4), _random_ee(4, 50)
+    relative = to_relative_ee_actions(actions, state)
+    assert relative.shape == (4, 50, 10)
+    _assert_same_ee(to_absolute_ee_actions(relative, state), actions)
+
+
+def test_relative_ee_pairs_each_sample_with_its_own_state_when_batch_equals_horizon():
+    # A round trip alone can't catch wrong pairing: decoding undoes the same mistake.
+    torch.manual_seed(1)
+    state, actions = _random_ee(8), _random_ee(8, 8)
+    batched = to_relative_ee_actions(actions, state)
+    per_sample = torch.cat([to_relative_ee_actions(actions[i : i + 1], state[i : i + 1]) for i in range(8)])
+    torch.testing.assert_close(batched, per_sample, atol=1e-6, rtol=0)
+    _assert_same_ee(to_absolute_ee_actions(batched, state), actions)
+
+
+def test_relative_ee_single_action_decode_matches_chunk_decode():
+    torch.manual_seed(2)
+    state, actions = _random_ee(4), _random_ee(4, 50)
+    relative = to_relative_ee_actions(actions, state)
+    chunk = to_absolute_ee_actions(relative, state)
+    for t in (0, 17, 49):
+        _assert_same_ee(to_absolute_ee_actions(relative[:, t], state), chunk[:, t])
+
+
+def test_relative_ee_gripper_down_roundtrip_with_mixed_quaternion_signs():
+    torch.manual_seed(3)
+    state, actions = _gripper_down_ee(4), _gripper_down_ee(4, 50)
+    relative = to_relative_ee_actions(actions, state)
+    _assert_same_ee(to_absolute_ee_actions(relative, state), actions)
+    # q and -q are the same rotation, so flipping every sign must not change the encoding.
+    flipped_state, flipped_actions = state.clone(), actions.clone()
+    flipped_state[..., 3:7] *= -1
+    flipped_actions[..., 3:7] *= -1
+    torch.testing.assert_close(
+        to_relative_ee_actions(flipped_actions, flipped_state), relative, atol=1e-6, rtol=0
+    )
+
+
+def test_relative_ee_pose_relative_to_itself_is_identity():
+    # Known values: zero translation, identity rotation (columns [1,0,0],[0,1,0] -> [1,0,0,1,0,0]).
+    torch.manual_seed(4)
+    state = _random_ee(4)
+    expected = torch.cat(
+        [torch.zeros(4, 3), torch.tensor([1.0, 0, 0, 1, 0, 0]).expand(4, 6), state[:, 7:]], dim=-1
+    )
+    torch.testing.assert_close(to_relative_ee_actions(state, state), expected, atol=1e-5, rtol=0)
+
+
+def test_relative_ee_known_values_pin_frame_and_6d_layout():
+    s = 0.5**0.5  # quaternion [0, 0, s, s] = +90 deg about z
+    # Rotation layout: target rotated +90 deg about z from an identity reference.
+    # R_z(90) = [[0,-1,0],[1,0,0],[0,0,1]]; first two columns, row by row -> [0,-1, 1,0, 0,0].
+    reference = torch.tensor([[0.0, 0, 0, 0, 0, 0, 1, 0.3]])
+    target = torch.tensor([[0.0, 0, 0, 0, 0, s, s, 0.7]])
+    expected = torch.tensor([[0.0, 0, 0, 0, -1, 1, 0, 0, 0, 0.7]])
+    torch.testing.assert_close(to_relative_ee_actions(target, reference), expected, atol=1e-6, rtol=0)
+
+    # EE frame: the reference gripper is turned +90 deg about z, so its x-axis points along base +y.
+    # A target 1 m along base +y is therefore 1 m along the gripper's own x-axis.
+    reference = torch.tensor([[1.0, 0, 0, 0, 0, s, s, 0.3]])
+    target = torch.tensor([[1.0, 1, 0, 0, 0, s, s, 0.7]])
+    expected = torch.tensor([[1.0, 0, 0, 1, 0, 0, 1, 0, 0, 0.7]])
+    torch.testing.assert_close(to_relative_ee_actions(target, reference), expected, atol=1e-6, rtol=0)
+
+
+def test_relative_ee_matches_inverse_reference_transform():
+    # Pins the convention itself: EE frame, T_rel = inv(T_ref) @ T. A round trip can't.
+    torch.manual_seed(5)
+    state, actions = _random_ee(4), _random_ee(4, 50)
+    relative = to_relative_ee_actions(actions, state)
+    expected = torch.linalg.inv(_homogeneous(state))[:, None] @ _homogeneous(actions)
+    torch.testing.assert_close(relative[..., :3].double(), expected[..., :3, 3], atol=1e-5, rtol=0)
+    torch.testing.assert_close(
+        rot6d_to_rotmat(relative[..., 3:9]).double(), expected[..., :3, :3], atol=1e-5, rtol=0
+    )
+
+
+# ---------------------------------------------------------------------------
+# Processor steps
+# ---------------------------------------------------------------------------
+
+
+def test_relative_ee_training_transition_through_steps():
+    # SmolVLA loads observation frames [0], so the training state arrives as [B, 1, 8].
+    torch.manual_seed(6)
+    state, actions = _random_ee(2, 1), _random_ee(2, 50)
+    actions[:, 0] = state[:, 0]  # first target equals the reference
+
+    transition = batch_to_transition({OBS_STATE: state, ACTION: actions})
+    transition = RelativeEEActionsStep(state_frame=0)(transition)
+    transition = EEStateStep()(transition)
+
+    relative = transition[TransitionKey.ACTION]
+    assert relative.shape == (2, 50, 10)
+    assert transition[TransitionKey.OBSERVATION][OBS_STATE].shape == (2, 1, 10)
+    torch.testing.assert_close(relative, to_relative_ee_actions(actions, state[:, 0]), atol=1e-6, rtol=0)
+    torch.testing.assert_close(relative[:, 0, :3], torch.zeros(2, 3), atol=1e-5, rtol=0)
+
+
+def test_relative_ee_state_frame_selects_the_current_frame():
+    # Diffusion-style observation frames [-1, 0]: the current frame is index 1.
+    torch.manual_seed(7)
+    state, actions = _random_ee(2, 2), _random_ee(2, 10)
+    transition = RelativeEEActionsStep(state_frame=1)(
+        batch_to_transition({OBS_STATE: state, ACTION: actions})
+    )
+    torch.testing.assert_close(
+        transition[TransitionKey.ACTION], to_relative_ee_actions(actions, state[:, 1]), atol=1e-6, rtol=0
+    )
+
+
+def test_relative_ee_stacked_state_without_state_frame_raises():
+    transition = batch_to_transition({OBS_STATE: _random_ee(2, 1), ACTION: _random_ee(2, 10)})
+    with pytest.raises(ValueError, match="state_frame is unset"):
+        RelativeEEActionsStep()(transition)
+
+
+def test_ee_state_step_matches_ee_to_rot6d():
+    # The stats are computed with ee_to_rot6d, so the step must produce exactly the same values.
+    state = _random_ee(3)
+    stepped = EEStateStep()(batch_to_transition({OBS_STATE: state}))[TransitionKey.OBSERVATION][OBS_STATE]
+    torch.testing.assert_close(stepped, ee_to_rot6d(state), atol=0, rtol=0)
+
+
+def test_absolute_ee_step_decodes_against_cached_reference():
+    torch.manual_seed(8)
+    relative_step = RelativeEEActionsStep()
+    absolute_step = AbsoluteEEActionsStep(relative_step=relative_step)
+    state = _random_ee(1)
+    relative_action = to_relative_ee_actions(_random_ee(1), state)
+
+    relative_step(
+        batch_to_transition({OBS_STATE: state})
+    )  # inference preprocess: no action, caches the state
+    decoded = absolute_step(batch_to_transition({ACTION: relative_action}))[TransitionKey.ACTION]
+
+    _assert_same_ee(decoded, to_absolute_ee_actions(relative_action, state))
+
+
+def test_relative_ee_reference_is_held_while_chunk_is_in_flight():
+    relative_step = RelativeEEActionsStep()
+    queue = {"size": 0}
+    policy = SimpleNamespace(count_queued_actions=lambda: queue["size"])
+    assert bind_relative_anchor(policy, SimpleNamespace(steps=[relative_step])) is relative_step
+
+    first, second, third = _random_ee(1), _random_ee(1), _random_ee(1)
+    relative_step(batch_to_transition({OBS_STATE: first}))  # queue empty: new chunk, cache first
+    queue["size"] = 49
+    relative_step(batch_to_transition({OBS_STATE: second}))  # chunk in flight: keep first
+    torch.testing.assert_close(relative_step.get_cached_state(), first, atol=0, rtol=0)
+    queue["size"] = 0
+    relative_step(batch_to_transition({OBS_STATE: third}))  # queue drained: re-anchor
+    torch.testing.assert_close(relative_step.get_cached_state(), third, atol=0, rtol=0)
+
+
+def test_relative_ee_steps_get_config_roundtrip():
+    # Loading a saved pipeline rebuilds each step from its get_config().
+    for step in (RelativeEEActionsStep(state_frame=0), EEStateStep(), AbsoluteEEActionsStep()):
+        rebuilt = type(step)(**step.get_config())
+        assert rebuilt.get_config() == step.get_config()
+    assert RelativeEEActionsStep(**RelativeEEActionsStep(state_frame=1).get_config()).state_frame == 1
+
+
+def test_relative_ee_steps_transform_features():
+    features = {
+        PipelineFeatureType.OBSERVATION: {OBS_STATE: PolicyFeature(FeatureType.STATE, (8,))},
+        PipelineFeatureType.ACTION: {ACTION: PolicyFeature(FeatureType.ACTION, (8,))},
+    }
+    model_side = EEStateStep().transform_features(RelativeEEActionsStep().transform_features(features))
+    assert model_side[PipelineFeatureType.OBSERVATION][OBS_STATE].shape == (10,)
+    assert model_side[PipelineFeatureType.ACTION][ACTION].shape == (10,)
+
+    robot_side = AbsoluteEEActionsStep().transform_features(model_side)
+    assert robot_side[PipelineFeatureType.ACTION][ACTION].shape == (8,)
+
+    # Disabled steps leave the declared shapes alone, and the input is never mutated.
+    assert RelativeEEActionsStep(enabled=False).transform_features(features) == features
+    assert EEStateStep(enabled=False).transform_features(features) == features
+    assert features[PipelineFeatureType.ACTION][ACTION].shape == (8,)
+
+
+# ---------------------------------------------------------------------------
+# Statistics
+# ---------------------------------------------------------------------------
+
+
+def _ee_x(x: float, gripper: float) -> list[float]:
+    """8D EE vector at position (x, 0, 0) with identity rotation."""
+    return [x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, gripper]
+
+
+def test_relative_ee_stats_anchor_on_state_and_stay_within_episodes():
+    # Imported here so the tests above still run without the dataset extra installed.
+    from lerobot.datasets.compute_rel_ee_stats import compute_relative_ee_stats
+
+    actions = np.array(
+        [_ee_x(0.0, 0.0), _ee_x(1.0, 0.2), _ee_x(10.0, 0.4), _ee_x(11.0, 0.6)], dtype=np.float32
+    )
+    states = np.array(
+        [_ee_x(0.0, 0.0), _ee_x(0.5, 0.2), _ee_x(10.0, 0.4), _ee_x(10.5, 0.6)], dtype=np.float32
+    )
+    stats = compute_relative_ee_stats(
+        {ACTION: actions, OBS_STATE: states, "episode_index": np.array([0, 0, 1, 1])}, chunk_size=2
+    )
+    # Per episode: (0, 1) from t=0 and (0.5) from t=1; the target past the episode end is excluded.
+    # Anchoring on the action instead of the state would give (0, 1) and (0), so a mean of 1/3.
+    np.testing.assert_allclose(stats[ACTION]["mean"][0], 0.5, atol=1e-6)
+    np.testing.assert_allclose(stats[OBS_STATE]["mean"][0], (0 + 0.5 + 10 + 10.5) / 4, atol=1e-6)
+    assert stats[ACTION]["mean"].shape == (10,)
+    assert stats[OBS_STATE]["mean"].shape == (10,)
+
+
+def test_relative_ee_stats_identity_rot6d():
+    from lerobot.datasets.compute_rel_ee_stats import compute_relative_ee_stats
+
+    actions = np.array(
+        [_ee_x(0.0, 0.0), _ee_x(1.0, 0.2), _ee_x(10.0, 0.4), _ee_x(11.0, 0.6)], dtype=np.float32
+    )
+    stats = compute_relative_ee_stats(
+        {ACTION: actions, OBS_STATE: actions.copy(), "episode_index": np.array([0, 0, 1, 1])},
+        chunk_size=2,
+        identity_rot6d=True,
+    )
+    for key in (ACTION, OBS_STATE):
+        np.testing.assert_allclose(stats[key]["min"][3:9], -1.0)
+        np.testing.assert_allclose(stats[key]["max"][3:9], 1.0)
+        np.testing.assert_allclose(stats[key]["mean"][3:9], 0.0)
+        np.testing.assert_allclose(stats[key]["std"][3:9], 1.0)

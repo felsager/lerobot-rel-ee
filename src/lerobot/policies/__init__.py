@@ -43,6 +43,7 @@ from .rtc import (
     ActionQueue,
     QueueSnapshot,
     RTCConfig,
+    reanchor_relative_ee_rtc_prefix,
     reanchor_relative_rtc_prefix,
     validate_trained_rtc_horizon,
 )
@@ -97,6 +98,7 @@ __all__ = [
     "ActionQueue",
     "QueueSnapshot",
     "RTCConfig",
+    "reanchor_relative_ee_rtc_prefix",
     "reanchor_relative_rtc_prefix",
     "validate_trained_rtc_horizon",
     # Utility functions

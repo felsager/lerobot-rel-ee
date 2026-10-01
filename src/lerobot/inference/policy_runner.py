@@ -28,9 +28,11 @@ import torch
 from lerobot.policies import PreTrainedPolicy, validate_trained_rtc_horizon
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    EEStateStep,
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
+    RelativeEEActionsStep,
     RenameObservationsProcessorStep,
 )
 from lerobot.utils import OBS_STATE, QUERY_KIND, QUERY_TEXT
@@ -124,16 +126,22 @@ class PolicyRunner:
             rtc_horizon=rtc_config.execution_horizon if rtc_modes and rtc_config is not None else 0,
             retains_session_state=spec.retains_session_state,
         )
-        self._validate_feature_contract()
         self._validate_processor_pair(preprocessor, postprocessor)
         self._relative_step = next(
             (
                 step
                 for step in preprocessor.steps
-                if isinstance(step, RelativeActionsProcessorStep) and step.enabled
+                if isinstance(step, RelativeActionsProcessorStep)
+                and not isinstance(step, RelativeEEActionsStep)
+                and step.enabled
             ),
             None,
         )
+        self._relative_ee_step = next(
+            (step for step in preprocessor.steps if isinstance(step, RelativeEEActionsStep) and step.enabled),
+            None,
+        )
+        self._validate_feature_contract()
         self._normalizer_step = next(
             (step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep)), None
         )
@@ -183,17 +191,33 @@ class PolicyRunner:
                 raise ValueError("Relative action postprocessor must be paired with its preprocessor.")
 
     def _validate_feature_contract(self) -> None:
-        self.policy.validate_chunk_input_features(self.capabilities.features)
+        features = self.capabilities.features
+        state = next((feature for feature in features if feature.name == OBS_STATE), None)
+        if self._relative_ee_step is not None:
+            if state is None or state.kind != "tensor" or state.shape != (8,):
+                raise ValueError("Relative EE requires an 8D canonical state.")
+            if not any(isinstance(step, EEStateStep) and step.enabled for step in self.preprocessor.steps):
+                raise ValueError(
+                    "Relative EE requires an enabled EEStateStep to convert the canonical state."
+                )
+            features = tuple(
+                replace(feature, shape=(10,), names=()) if feature.name == OBS_STATE else feature
+                for feature in features
+            )
+        self.policy.validate_chunk_input_features(features)
         output = self.policy.config.action_feature
         action = self.capabilities.action_feature
-        if output is None or action.name != "action" or action.shape != tuple(output.shape):
+        if output is None or action.name != "action":
+            raise ValueError("Canonical action feature differs from policy output_features.")
+        if self._relative_ee_step is not None and (action.shape != (8,) or tuple(output.shape) != (10,)):
+            raise ValueError("Relative EE requires 8D canonical actions and 10D model actions.")
+        if self._relative_ee_step is None and action.shape != tuple(output.shape):
             raise ValueError("Canonical action feature differs from policy output_features.")
         if action.kind != "tensor" or len(action.shape) != 1 or action.dtype != "float32":
             raise ValueError("The default runner requires a one-dimensional float32 action representation.")
         checkpoint_names = getattr(self.policy.config, "action_feature_names", None)
         if checkpoint_names and tuple(checkpoint_names) != action.names:
             raise ValueError("Canonical action component order differs from checkpoint action_feature_names.")
-        state = next((feature for feature in self.capabilities.features if feature.name == OBS_STATE), None)
         if (
             state is not None
             and state.names
@@ -202,6 +226,8 @@ class PolicyRunner:
             and state.names != action.names
         ):
             raise ValueError("State and action component order must be aligned.")
+        if self._relative_ee_step is not None and ExecutionMode.RTC_TRAINED in self.capabilities.modes:
+            raise ValueError("Relative EE policies only support guided RTC.")
 
     def _batch(self, observation: ObservationSnapshot) -> dict[str, Any]:
         if set(observation.features) != {feature.name for feature in self.capabilities.features}:
@@ -257,6 +283,7 @@ class PolicyRunner:
                 model_continuation=model_continuation,
                 canonical_continuation=canonical_continuation,
                 relative_step=self._relative_step,
+                relative_ee_step=self._relative_ee_step,
                 normalizer_step=self._normalizer_step,
             )
             self._model_action_dim = prediction.model_actions.shape[1]

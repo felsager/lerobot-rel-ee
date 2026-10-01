@@ -29,7 +29,8 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.inference import ExecutionMode, ObservationSnapshot, PolicyRunner
 from lerobot.policies import PreTrainedPolicy, get_policy_class, make_pre_post_processors
 from lerobot.policies.factory import has_peft_adapter_config
-from lerobot.processor import RenderRuntimeMessagesStep
+from lerobot.processor import EEStateStep, RenderRuntimeMessagesStep
+from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import _peft_available, require_package
 
 from .configs import ServerConfig
@@ -175,8 +176,11 @@ def load_deployment(cfg: ServerConfig) -> tuple[PolicyRunner, str]:
     if execution_steps is not None and runner.capabilities.execution_steps != execution_steps:
         raise ValueError("Loaded policy does not honor the requested execution.n_action_steps slice")
     identity = artifact_identity(artifacts, _inference_identity(cfg, policy_cfg))
+    warmup_features = {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in cfg.features}
+    if any(isinstance(step, EEStateStep) and step.enabled for step in preprocessor.steps):
+        warmup_features[OBS_STATE][6] = 1.0
     warmup = ObservationSnapshot(
-        {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in cfg.features},
+        warmup_features,
         0.0,
         "warmup",
         observation_id="warmup",

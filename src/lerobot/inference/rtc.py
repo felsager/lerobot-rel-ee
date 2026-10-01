@@ -32,6 +32,7 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
+    RelativeEEActionsStep,
 )
 from lerobot.utils.feature_utils import build_dataset_frame
 
@@ -139,10 +140,10 @@ class RTCInferenceEngine(InferenceEngine):
         self._model_action_dim: int | None = None
         action_feature = getattr(policy.config, "action_feature", None)
         self._canonical_action_dim = (
-            action_feature.shape[0]
-            if action_feature is not None
-            else dataset_features.get("action", {}).get("shape", (len(robot_wrapper.action_features),))[0]
+            action_feature.shape[0] if action_feature is not None else len(robot_wrapper.action_features)
         )
+        if "action" in dataset_features:
+            self._canonical_action_dim = dataset_features["action"]["shape"][0]
         self._robot = robot_wrapper
         self._rtc_config = rtc_config
         # Same feature spec sync uses, so both engines order observation.state identically.
@@ -212,7 +213,17 @@ class RTCInferenceEngine(InferenceEngine):
 
         # Processor introspection for relative-action re-anchoring.
         self._relative_step = next(
-            (s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled),
+            (
+                s
+                for s in preprocessor.steps
+                if isinstance(s, RelativeActionsProcessorStep)
+                and not isinstance(s, RelativeEEActionsStep)
+                and s.enabled
+            ),
+            None,
+        )
+        self._relative_ee_step = next(
+            (s for s in preprocessor.steps if isinstance(s, RelativeEEActionsStep) and s.enabled),
             None,
         )
         self._normalizer_step = next(
@@ -229,6 +240,15 @@ class RTCInferenceEngine(InferenceEngine):
                         k for k in robot_wrapper.action_features if k.endswith(".pos")
                     ]
             logger.info("Relative actions enabled: RTC prefix will be re-anchored")
+
+        if self._relative_ee_step is not None:
+            if rtc_config.mode == "trained":
+                raise ValueError(
+                    "Relative EE policies are only compatible with the guided RTC mode: their training "
+                    "never samples delayed prefixes, so --inference.rtc.mode=trained has no trained "
+                    "capacity to draw on. Use --inference.rtc.mode=guided (the default)."
+                )
+            logger.info("Relative EE enabled: RTC prefix will be re-anchored in SE(3)")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -612,6 +632,7 @@ class RTCInferenceEngine(InferenceEngine):
                         model_continuation=previous,
                         canonical_continuation=canonical_previous,
                         relative_step=self._relative_step,
+                        relative_ee_step=self._relative_ee_step,
                         normalizer_step=self._normalizer_step,
                     )
                     original, processed = prediction.model_actions, prediction.canonical_actions

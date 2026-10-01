@@ -29,6 +29,7 @@ from lerobot.processor.relative_action_processor import (
     RelativeActionsProcessorStep,
     to_relative_actions,
 )
+from lerobot.processor.relative_ee_action_processor import to_absolute_ee_actions, to_relative_ee_actions
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -54,6 +55,9 @@ RTCProcessor = _rtc_mod.RTCProcessor
 
 _rtc_relative_mod = _import_rtc_module("lerobot.policies.rtc.relative", "relative.py")
 reanchor_relative_rtc_prefix = _rtc_relative_mod.reanchor_relative_rtc_prefix
+reanchor_relative_ee_rtc_prefix = _rtc_relative_mod.reanchor_relative_ee_rtc_prefix
+
+_S = 0.5**0.5  # quaternion [0, 0, s, s] = +90 deg about z
 
 ACTION_DIM = 6
 CHUNK_SIZE = 50
@@ -121,6 +125,21 @@ class TestActionQueueRelativeActions:
 
         first_action = queue.get()
         torch.testing.assert_close(first_action, absolute_actions[0])
+
+    def test_leftover_snapshot_is_consistent(self):
+        """get_left_over_snapshot() returns the index and both leftover queues from one locked read."""
+        queue = ActionQueue(_make_rtc_config())
+        original = torch.randn(5, 10)
+        processed = torch.randn(5, 8)
+        queue.merge(original, processed, real_delay=0)
+        queue.get()
+        queue.get()
+
+        index, original_leftover, processed_leftover = queue.get_left_over_snapshot()
+
+        assert index == 2
+        torch.testing.assert_close(original_leftover, original[2:])
+        torch.testing.assert_close(processed_leftover, processed[2:])
 
 
 class TestRTCDenoiseWithRelativeLeftovers:
@@ -710,3 +729,53 @@ class TestMultiChunkConsistency:
         )
 
         assert result.shape == x_t.shape
+
+
+class TestRelativeEEReanchoring:
+    """RTC re-anchoring for relative EE actions: absolute leftovers re-expressed in SE(3)."""
+
+    def test_prefix_is_reanchored_from_absolute_leftovers(self):
+        """The re-anchored prefix equals the relative EE encoding against the current state."""
+        current_state = torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, _S, _S, 0.5]])
+        absolute_actions = torch.tensor(
+            [
+                [1.1, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0, 0.1],
+                [1.2, 2.1, 3.0, 0.0, _S, 0.0, _S, 0.9],
+            ]
+        )
+
+        actual = reanchor_relative_ee_rtc_prefix(
+            prev_actions_absolute=absolute_actions,
+            current_state=current_state,
+            normalizer_step=None,
+            policy_device="cpu",
+        )
+
+        torch.testing.assert_close(actual, to_relative_ee_actions(absolute_actions, current_state[0]))
+
+    def test_reanchored_prefix_decodes_back_to_the_same_absolute_poses(self):
+        """Re-expressed against the new reference, the leftovers still describe the same absolute targets.
+
+        Elementwise re-anchoring fails this as soon as the reference is rotated.
+        """
+        new_state = torch.tensor([[0.4, -0.2, 0.3, 0.0, 0.0, _S, _S, 0.5]])
+        absolute_actions = torch.tensor(
+            [
+                [0.5, -0.1, 0.3, 0.0, 0.0, _S, _S, 0.2],
+                [0.6, 0.0, 0.25, 0.0, _S, 0.0, _S, 0.8],
+            ]
+        )
+
+        relative = reanchor_relative_ee_rtc_prefix(
+            prev_actions_absolute=absolute_actions,
+            current_state=new_state,
+            normalizer_step=None,
+            policy_device="cpu",
+        )
+        decoded = to_absolute_ee_actions(relative, new_state[0])
+
+        torch.testing.assert_close(decoded[:, :3], absolute_actions[:, :3], atol=1e-5, rtol=0)
+        torch.testing.assert_close(decoded[:, 7:], absolute_actions[:, 7:], atol=1e-6, rtol=0)
+        # q and -q are the same rotation, so compare up to sign.
+        dots = (decoded[:, 3:7] * absolute_actions[:, 3:7]).sum(dim=-1).abs()
+        torch.testing.assert_close(dots, torch.ones(2), atol=1e-5, rtol=0)
