@@ -19,8 +19,8 @@ import pytest
 import torch
 
 import lerobot.policies.factory as policy_factory
-from lerobot.configs import FeatureType
-from lerobot.utils.constants import ACTION
+from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 def test_make_policy_keeps_peft_adapter_and_base_revisions_separate(monkeypatch):
@@ -137,3 +137,38 @@ def test_make_policy_reads_action_names(monkeypatch, action_key, raw_names, expe
     assert cfg.action_feature_names == expected_names
     assert dataset_meta.features[action_key]["names"] == raw_names
     assert cfg.output_features[ACTION].type is FeatureType.ACTION
+
+
+@pytest.mark.parametrize(
+    "existing_input_features",
+    [
+        {},  # config built from the dataset
+        {OBS_STATE: PolicyFeature(FeatureType.STATE, (6,))},  # pretrained config, e.g. smolvla_base
+    ],
+    ids=["fresh_config", "pretrained_config"],
+)
+def test_make_policy_uses_model_facing_relative_ee_shapes(monkeypatch, existing_input_features):
+    cfg = SimpleNamespace(
+        type="mock",
+        device="cpu",
+        pretrained_path=None,
+        pretrained_revision=None,
+        use_peft=False,
+        use_relative_ee=True,
+        input_features=dict(existing_input_features),
+        output_features={},
+    )
+    dataset_meta = SimpleNamespace(features={}, stats={})
+    policy_class = MagicMock(return_value=torch.nn.Linear(1, 1))
+    raw_features = {
+        OBS_STATE: PolicyFeature(FeatureType.STATE, (8,)),
+        ACTION: PolicyFeature(FeatureType.ACTION, (8,)),
+    }
+    monkeypatch.setattr(policy_factory, "get_policy_class", lambda _: policy_class)
+    monkeypatch.setattr(policy_factory, "dataset_to_policy_features", lambda _: raw_features)
+    monkeypatch.setattr(policy_factory, "validate_visual_features_consistency", lambda *args: None)
+
+    policy_factory.make_policy(cfg, ds_meta=dataset_meta)
+
+    assert cfg.input_features[OBS_STATE].shape == (10,)
+    assert cfg.output_features[ACTION].shape == (10,)

@@ -28,7 +28,7 @@ import torch
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
 
-from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
 from lerobot.lerobot_types import PolicyAction
 from lerobot.processor import (
@@ -37,6 +37,7 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -291,9 +292,17 @@ def make_policy(
     if rename_map:
         features = {rename_map.get(key, key): feature for key, feature in features.items()}
 
+    if getattr(cfg, "use_relative_ee", False):
+        if ACTION not in features or features[ACTION].shape != (8,):
+            raise ValueError("Relative EE requires raw action features with shape (8,).")
+        features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(10,))
+        features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(10,))
+
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+    if getattr(cfg, "use_relative_ee", False):
+        cfg.input_features[OBS_STATE] = features[OBS_STATE]
 
     # Store action feature names for relative_exclude_joints support
     if ds_meta is not None and hasattr(cfg, "action_feature_names"):

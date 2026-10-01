@@ -575,6 +575,10 @@ def train(cfg: TrainPipelineConfig) -> None:
         # Language fine-tuning must use the active recipe, not the saved processor recipe.
         processor_pretrained_path = None
 
+    if not cfg.resume and getattr(active_cfg, "use_relative_ee", False):
+        # Build EE steps and use derived stats instead of the base model's processors.
+        processor_pretrained_path = None
+
     processor_kwargs = ProcessorConfigKwargs()
     processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:

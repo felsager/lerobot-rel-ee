@@ -80,6 +80,9 @@ dependencies = [
     # Serialization & checkpointing
     "safetensors>=0.4.3,<1.0.0",
 
+    # 3D rotation helpers
+    "roma>=1.6,<2.0.0",
+
     # Lightweight utilities
     "packaging>=24.2,<26.0",
     "termcolor>=2.4.0,<4.0.0",

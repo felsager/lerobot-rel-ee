@@ -29,6 +29,11 @@ class SmolVLAConfig(PreTrainedConfig):
     chunk_size: int = 50
     n_action_steps: int = 50
 
+    use_relative_ee: bool = False  # Anchor EE actions to the current state.
+    rot6d_identity_norm: bool = (
+        False  # Compute stats that leave action/state rot6d unchanged by normalization.
+    )
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -110,6 +115,12 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.use_relative_ee:
+            if self.n_obs_steps != 1:
+                raise ValueError("Relative EE mode requires n_obs_steps=1")
+            if self.max_state_dim < 10 or self.max_action_dim < 10:
+                raise ValueError("Relative EE mode requires max_state_dim>=10 and max_action_dim>=10")
+
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

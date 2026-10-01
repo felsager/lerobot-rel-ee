@@ -98,6 +98,12 @@ from .relative_action_processor import (
     to_absolute_actions,
     to_relative_actions,
 )
+from .relative_ee_action_processor import (
+    AbsoluteEEActionsStep,
+    EEStateStep,
+    RelativeEEActionsStep,
+    to_relative_ee_actions,
+)
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
 from .render_messages_processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
@@ -139,7 +145,11 @@ __all__ = [
     "make_default_robot_observation_processor",
     "make_policy_processor_pipelines",
     "AbsoluteActionsProcessorStep",
+    "AbsoluteEEActionsStep",
+    "EEStateStep",
     "RelativeActionsProcessorStep",
+    "to_relative_ee_actions",
+    "RelativeEEActionsStep",
     "bind_relative_anchor",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
