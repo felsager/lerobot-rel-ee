@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -267,6 +269,53 @@ def test_relative_ee_steps_transform_features():
 def _ee_x(x: float, gripper: float) -> list[float]:
     """8D EE vector at position (x, 0, 0) with identity rotation."""
     return [x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, gripper]
+
+
+def test_relative_ee_stats_cache_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lerobot.datasets import compute_rel_ee_stats as stats_module
+
+    actions = np.array([_ee_x(0.0, 0.0), _ee_x(1.0, 0.5)], dtype=np.float32)
+    states = actions.copy()
+    episodes = np.array([0, 0])
+    key = stats_module.relative_ee_stats_cache_key
+    original = key(actions, states, episodes, 50)
+    assert original == key(actions.copy(), states.copy(), episodes.copy(), 50)
+    assert original == key(actions.astype(np.float64), np.asfortranarray(states), episodes, 50)
+    assert original != key(actions, states, episodes, 25)
+    changed = actions.copy()
+    changed[0, 0] += 0.1
+    assert original != key(changed, states, episodes, 50)
+    assert original != key(actions, changed, episodes, 50)
+    assert original != key(actions, states, np.array([0, 1]), 50)
+    assert original != key(actions[:1], states[:1], episodes[:1], 50)
+    assert original != key(actions[::-1], states[::-1], episodes[::-1], 50)
+    monkeypatch.setattr(stats_module, "_RELATIVE_EE_STATS_VERSION", 2)
+    assert original != key(actions, states, episodes, 50)
+
+
+def test_relative_ee_stats_cache_reuse(tmp_path: Path) -> None:
+    from lerobot.datasets.compute_rel_ee_stats import (
+        compute_relative_ee_stats,
+        load_or_compute_relative_ee_stats,
+    )
+
+    poses = np.array([_ee_x(0, 0), _ee_x(1, 1)], dtype=np.float32)
+    data = {ACTION: poses, OBS_STATE: poses.copy(), "episode_index": np.array([0, 0])}
+    with patch(
+        "lerobot.datasets.compute_rel_ee_stats.compute_relative_ee_stats", wraps=compute_relative_ee_stats
+    ) as compute:
+        raw = load_or_compute_relative_ee_stats(data, 2, tmp_path)
+        identity = load_or_compute_relative_ee_stats(data, 2, tmp_path, identity_rot6d=True)
+        loaded = load_or_compute_relative_ee_stats(data, 2, tmp_path)
+        assert compute.call_count == 1
+        for key in (ACTION, OBS_STATE):
+            for name in raw[key]:
+                np.testing.assert_array_equal(loaded[key][name], raw[key][name])
+            np.testing.assert_array_equal(identity[key]["mean"][3:9], 0)
+            np.testing.assert_array_equal(identity[key]["std"][3:9], 1)
+        load_or_compute_relative_ee_stats(data, 1, tmp_path)
+        assert compute.call_count == 2
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_relative_ee_stats_anchor_on_state_and_stay_within_episodes():
