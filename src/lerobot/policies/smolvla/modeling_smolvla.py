@@ -333,7 +333,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
-    def prepare_images(self, batch):
+    def prepare_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
@@ -365,6 +365,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
             device = img.device
             if f"{key}_padding_mask" in batch:
                 mask = batch[f"{key}_padding_mask"].bool()
+                # Observation queries may add time to masks. Match the latest
+                # image selected above without squeezing away the batch axis.
+                if mask.ndim == 2 and (
+                    mask.shape[1] == 1
+                    or (batch[key].ndim == 5 and mask.shape[1] == batch[key].shape[1])
+                ):
+                    mask = mask[:, -1]
+                if mask.shape != (bsize,):
+                    raise ValueError(
+                        f"{key}_padding_mask must have one validity value per image; got {tuple(mask.shape)}"
+                    )
             else:
                 mask = torch.ones(bsize, dtype=torch.bool, device=device)
             images.append(img)
