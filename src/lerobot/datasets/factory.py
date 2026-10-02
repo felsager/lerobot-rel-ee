@@ -23,7 +23,7 @@ import torch
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets.compute_rel_ee_stats import compute_relative_ee_stats
+from lerobot.datasets.compute_rel_ee_stats import load_or_compute_relative_ee_stats
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
 
@@ -126,7 +126,12 @@ def _prepare_relative_ee_stats(
     identity_rot6d: bool = False,
 ) -> dict:
     derived_stats = (
-        compute_relative_ee_stats(dataset.hf_dataset, chunk_size, identity_rot6d=identity_rot6d)
+        load_or_compute_relative_ee_stats(
+            dataset.hf_dataset,
+            chunk_size,
+            cache_dir=dataset.root / "meta" / "relative_ee_stats",
+            identity_rot6d=identity_rot6d,
+        )
         if stats is None
         else stats
     )

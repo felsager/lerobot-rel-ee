@@ -2,17 +2,45 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
+from huggingface_hub.utils import WeakFileLock
 
 from lerobot.processor.relative_ee_action_processor import absolute_ee_to_relative, ee_to_rot6d
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .compute_stats import RunningQuantileStats
+from .io_utils import load_stats, write_stats
 
 logger = logging.getLogger(__name__)
+
+# Bump when EE conversion, target selection, or statistics computation changes.
+_RELATIVE_EE_STATS_VERSION = 1
+
+
+def relative_ee_stats_cache_key(
+    actions: np.ndarray,
+    states: np.ndarray,
+    episode_indices: np.ndarray,
+    chunk_size: int,
+) -> str:
+    """Hash selected rows in order, excluding normalization choices and video data."""
+    digest = hashlib.sha256(f"relative-ee:{_RELATIVE_EE_STATS_VERSION}:{chunk_size}".encode())
+    for name, values, dtype in (
+        (ACTION, actions, "<f4"),
+        (OBS_STATE, states, "<f4"),
+        ("episode_index", episode_indices, "<i8"),
+    ):
+        array = np.ascontiguousarray(values, dtype=dtype)
+        digest.update(f"{name}:{array.shape}:{dtype}:".encode())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
+
 
 # rot6d sits at dims [3:9] of both 10D model vectors: [pos(3), rot6d(6), gripper(1)].
 _ROT6D_SLICE = slice(3, 9)
@@ -47,6 +75,38 @@ def _force_identity_rot6d_stats(stats: dict[str, dict[str, np.ndarray]]) -> None
             array = feature_stats.get(stat_name)
             if array is not None:
                 array[_ROT6D_SLICE] = value
+
+
+def load_or_compute_relative_ee_stats(
+    hf_dataset,
+    chunk_size: int,
+    cache_dir: Path,
+    identity_rot6d: bool = False,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Reuse raw derived stats; apply rotation normalization overrides only in memory."""
+    columns = {
+        ACTION: np.asarray(hf_dataset[ACTION], dtype=np.float32),
+        OBS_STATE: np.asarray(hf_dataset[OBS_STATE], dtype=np.float32),
+        "episode_index": np.asarray(hf_dataset["episode_index"], dtype=np.int64),
+    }
+    key = relative_ee_stats_cache_key(
+        columns[ACTION], columns[OBS_STATE], columns["episode_index"], chunk_size
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / key
+    with WeakFileLock(cache_path.with_suffix(".lock")):
+        stats = load_stats(cache_path)
+        if stats is None:
+            logger.info("Computing relative EE statistics for %s", cache_path)
+            stats = compute_relative_ee_stats(columns, chunk_size)
+            with TemporaryDirectory(dir=cache_dir) as temporary_dir:
+                write_stats(stats, Path(temporary_dir))
+                Path(temporary_dir).replace(cache_path)
+        else:
+            logger.info("Loaded relative EE statistics from %s", cache_path)
+    if identity_rot6d:
+        _force_identity_rot6d_stats(stats)
+    return stats
 
 
 def compute_relative_ee_stats(
