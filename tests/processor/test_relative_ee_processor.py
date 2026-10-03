@@ -355,3 +355,83 @@ def test_relative_ee_stats_identity_rot6d():
         np.testing.assert_allclose(stats[key]["max"][3:9], 1.0)
         np.testing.assert_allclose(stats[key]["mean"][3:9], 0.0)
         np.testing.assert_allclose(stats[key]["std"][3:9], 1.0)
+
+
+@pytest.mark.parametrize("selection", [None, [1, 2], [3, 0, 3, 1]])
+@pytest.mark.parametrize("formatter", [None, "torch"])
+@pytest.mark.parametrize("fixed", [False, True])
+def test_arrow_relative_columns_preserve_legacy_hash(selection, formatter, fixed):
+    import hashlib
+
+    import pyarrow as pa
+    from datasets import Dataset, concatenate_datasets
+
+    from lerobot.datasets.compute_rel_ee_stats import _load_relative_ee_columns, relative_ee_stats_cache_key
+
+    poses = [_ee_x(i * 0.13, i / 4) for i in range(4)]
+    feature_type = pa.list_(pa.float32(), 8) if fixed else pa.list_(pa.float32())
+    table = pa.table(
+        {
+            ACTION: pa.array(poses, type=feature_type),
+            OBS_STATE: pa.array(poses[::-1], type=feature_type),
+            "episode_index": pa.array([0, 0, 1, 1], type=pa.int64()),
+        }
+    )
+    ds = concatenate_datasets([Dataset(table.slice(0, 2)), Dataset(table.slice(2, 2))])
+    if selection is not None:
+        ds = ds.select(selection)
+    ds = ds.with_format(formatter)
+    expected = {
+        k: np.asarray(ds[k], dtype=dtype)
+        for k, dtype in [(ACTION, np.float32), (OBS_STATE, np.float32), ("episode_index", np.int64)]
+    }
+    original_format = ds.format.copy()
+    actual = _load_relative_ee_columns(ds)
+    assert ds.format == original_format
+    legacy = hashlib.sha256(b"relative-ee:1:50")
+    for key, dtype in [(ACTION, "<f4"), (OBS_STATE, "<f4"), ("episode_index", "<i8")]:
+        np.testing.assert_array_equal(actual[key], expected[key])
+        values = np.ascontiguousarray(expected[key], dtype=dtype)
+        legacy.update(f"{key}:{values.shape}:{dtype}:".encode())
+        legacy.update(values.tobytes())
+    assert (
+        relative_ee_stats_cache_key(actual[ACTION], actual[OBS_STATE], actual["episode_index"], 50)
+        == legacy.hexdigest()
+    )
+
+
+def test_arrow_relative_cache_hits_existing_cache(tmp_path):
+    from datasets import Dataset
+
+    from lerobot.datasets.compute_rel_ee_stats import load_or_compute_relative_ee_stats
+
+    poses = np.array([_ee_x(0, 0), _ee_x(1, 1)], dtype=np.float32)
+    columns = {ACTION: poses, OBS_STATE: poses.copy(), "episode_index": np.array([0, 0])}
+    expected = load_or_compute_relative_ee_stats(columns, 2, tmp_path)
+    dataset = Dataset.from_dict(columns).with_format("torch")
+    with patch(
+        "lerobot.datasets.compute_rel_ee_stats.compute_relative_ee_stats",
+        side_effect=AssertionError("cache miss"),
+    ):
+        actual = load_or_compute_relative_ee_stats(dataset, 2, tmp_path)
+    for key in expected:
+        for stat in expected[key]:
+            np.testing.assert_array_equal(expected[key][stat], actual[key][stat])
+
+
+def test_empty_relative_columns_preserve_legacy_hash() -> None:
+    import hashlib
+
+    from lerobot.datasets.compute_rel_ee_stats import relative_ee_stats_cache_key
+
+    poses = np.empty((0, 8), dtype=np.float32)
+    episodes = np.empty(0, dtype=np.int64)
+    legacy = hashlib.sha256(b"relative-ee:1:50")
+    for name, array, dtype in [
+        (ACTION, poses, "<f4"),
+        (OBS_STATE, poses, "<f4"),
+        ("episode_index", episodes, "<i8"),
+    ]:
+        legacy.update(f"{name}:{array.shape}:{dtype}:".encode())
+        legacy.update(array.tobytes())
+    assert relative_ee_stats_cache_key(poses, poses, episodes, 50) == legacy.hexdigest()

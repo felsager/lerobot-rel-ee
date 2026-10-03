@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
+from collections.abc import Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
+import pyarrow as pa
 import torch
+from datasets import Dataset
 from huggingface_hub.utils import WeakFileLock
 
 from lerobot.processor.relative_ee_action_processor import absolute_ee_to_relative, ee_to_rot6d
@@ -38,7 +42,8 @@ def relative_ee_stats_cache_key(
     ):
         array = np.ascontiguousarray(values, dtype=dtype)
         digest.update(f"{name}:{array.shape}:{dtype}:".encode())
-        digest.update(array.tobytes())
+        if array.size:
+            digest.update(memoryview(array).cast("B"))
     return digest.hexdigest()
 
 
@@ -77,6 +82,31 @@ def _force_identity_rot6d_stats(stats: dict[str, dict[str, np.ndarray]]) -> None
                 array[_ROT6D_SLICE] = value
 
 
+def _load_relative_ee_columns(hf_dataset: Dataset | Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Read only needed Arrow columns, preserving selected row order and duplicates.
+
+    Going through Dataset's Arrow formatter honors its indices mapping; reading
+    hf_dataset.data directly would silently hash excluded or reordered rows.
+    """
+    dtypes = {ACTION: np.float32, OBS_STATE: np.float32, "episode_index": np.int64}
+    if not isinstance(hf_dataset, Dataset):
+        return {key: np.asarray(hf_dataset[key], dtype=dtype) for key, dtype in dtypes.items()}
+    table = hf_dataset.select_columns(list(dtypes)).with_format("arrow")[:]
+    columns = {}
+    for key, dtype in dtypes.items():
+        array = table.column(key).combine_chunks()
+        if key in (ACTION, OBS_STATE):
+            if not (pa.types.is_list(array.type) or pa.types.is_fixed_size_list(array.type)):
+                raise ValueError(f"Relative EE requires {key} to contain 8D vectors")
+            if not np.all(array.value_lengths().to_numpy(zero_copy_only=False) == 8):
+                raise ValueError(f"Relative EE requires {key} shape [frames, 8]")
+            values = array.flatten().to_numpy(zero_copy_only=False).reshape(len(array), 8)
+        else:
+            values = array.to_numpy(zero_copy_only=False)
+        columns[key] = np.asarray(values, dtype=dtype)
+    return columns
+
+
 def load_or_compute_relative_ee_stats(
     hf_dataset,
     chunk_size: int,
@@ -84,14 +114,19 @@ def load_or_compute_relative_ee_stats(
     identity_rot6d: bool = False,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Reuse raw derived stats; apply rotation normalization overrides only in memory."""
-    columns = {
-        ACTION: np.asarray(hf_dataset[ACTION], dtype=np.float32),
-        OBS_STATE: np.asarray(hf_dataset[OBS_STATE], dtype=np.float32),
-        "episode_index": np.asarray(hf_dataset["episode_index"], dtype=np.int64),
-    }
+    started = time.perf_counter()
+    logger.info("Loading relative EE statistics columns (Arrow for Hugging Face datasets)")
+    columns = _load_relative_ee_columns(hf_dataset)
+    logger.info(
+        "Loaded %d relative EE rows in %.2fs; hashing cache key",
+        len(columns[ACTION]),
+        time.perf_counter() - started,
+    )
+    hash_started = time.perf_counter()
     key = relative_ee_stats_cache_key(
         columns[ACTION], columns[OBS_STATE], columns["episode_index"], chunk_size
     )
+    logger.info("Relative EE cache key %s computed in %.2fs", key, time.perf_counter() - hash_started)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / key
     with WeakFileLock(cache_path.with_suffix(".lock")):
