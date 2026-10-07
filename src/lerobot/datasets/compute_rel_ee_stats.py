@@ -167,21 +167,29 @@ def compute_relative_ee_stats(
         raise ValueError(f"Relative EE requires chunk_size >= 1, got {chunk_size}")
 
     episode_indices = np.asarray(hf_dataset["episode_index"])
+    starts = np.flatnonzero(np.r_[True, episode_indices[1:] != episode_indices[:-1]])
+    ends = np.r_[starts[1:], len(episode_indices)]
+    if len(starts) != len(np.unique(episode_indices)):
+        raise ValueError("Relative EE statistics require each episode's frames to be contiguous")
+
+    order = np.argsort(episode_indices[starts], kind="stable")
+    starts, ends = starts[order], ends[order]
+
     action_stats = RunningQuantileStats()
     state_stats = RunningQuantileStats()
     num_action_targets = 0
 
-    for episode_index in np.unique(episode_indices):
-        frame_indices = np.flatnonzero(episode_indices == episode_index)
-        episode_actions = torch.from_numpy(actions[frame_indices])
-        episode_states = torch.from_numpy(states[frame_indices])
+    for start, end in zip(starts.tolist(), ends.tolist()):
+        num_frames = end - start
+        episode_actions = torch.from_numpy(actions[start:end])
+        episode_states = torch.from_numpy(states[start:end])
 
         state_stats.update(ee_to_rot6d(episode_states).numpy())
 
-        for batch_start in range(0, len(frame_indices), 20_000):
-            base_indices = torch.arange(batch_start, min(batch_start + 20_000, len(frame_indices)))
+        for batch_start in range(0, num_frames, 20_000):
+            base_indices = torch.arange(batch_start, min(batch_start + 20_000, num_frames))
             target_indices = base_indices[:, None] + torch.arange(chunk_size)[None, :]
-            valid = target_indices < len(frame_indices)
+            valid = target_indices < num_frames
             targets = episode_actions[target_indices[valid]]
             references = episode_states[base_indices[:, None].expand_as(target_indices)[valid]]
             relative_actions = absolute_ee_to_relative(references, targets)
