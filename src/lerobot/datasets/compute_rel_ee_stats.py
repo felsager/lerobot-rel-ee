@@ -15,8 +15,9 @@ import torch
 from datasets import Dataset
 from huggingface_hub.utils import WeakFileLock
 
-from lerobot.processor.relative_ee_action_processor import absolute_ee_to_relative, ee_to_rot6d
+from lerobot.processor.relative_ee_action_processor import absolute_ee_to_relative, ee_to_rot_repr
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.rotation_representations import RotationRepresentation
 
 from .compute_stats import RunningQuantileStats
 from .io_utils import load_stats, write_stats
@@ -24,7 +25,7 @@ from .io_utils import load_stats, write_stats
 logger = logging.getLogger(__name__)
 
 # Bump when EE conversion, target selection, or statistics computation changes.
-_RELATIVE_EE_STATS_VERSION = 1
+_RELATIVE_EE_STATS_VERSION = 2
 
 
 def relative_ee_stats_cache_key(
@@ -32,9 +33,12 @@ def relative_ee_stats_cache_key(
     states: np.ndarray,
     episode_indices: np.ndarray,
     chunk_size: int,
+    rotation_representation: RotationRepresentation,
 ) -> str:
     """Hash selected rows in order, excluding normalization choices and video data."""
-    digest = hashlib.sha256(f"relative-ee:{_RELATIVE_EE_STATS_VERSION}:{chunk_size}".encode())
+    digest = hashlib.sha256(
+        f"relative-ee:{_RELATIVE_EE_STATS_VERSION}:{chunk_size}:{rotation_representation}".encode()
+    )
     for name, values, dtype in (
         (ACTION, actions, "<f4"),
         (OBS_STATE, states, "<f4"),
@@ -111,6 +115,7 @@ def load_or_compute_relative_ee_stats(
     hf_dataset,
     chunk_size: int,
     cache_dir: Path,
+    rot_repr: RotationRepresentation,
     identity_rot6d: bool = False,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Reuse raw derived stats; apply rotation normalization overrides only in memory."""
@@ -124,7 +129,7 @@ def load_or_compute_relative_ee_stats(
     )
     hash_started = time.perf_counter()
     key = relative_ee_stats_cache_key(
-        columns[ACTION], columns[OBS_STATE], columns["episode_index"], chunk_size
+        columns[ACTION], columns[OBS_STATE], columns["episode_index"], chunk_size, rot_repr
     )
     logger.info("Relative EE cache key %s computed in %.2fs", key, time.perf_counter() - hash_started)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -133,7 +138,7 @@ def load_or_compute_relative_ee_stats(
         stats = load_stats(cache_path)
         if stats is None:
             logger.info("Computing relative EE statistics for %s", cache_path)
-            stats = compute_relative_ee_stats(columns, chunk_size)
+            stats = compute_relative_ee_stats(columns, chunk_size, rot_repr)
             with TemporaryDirectory(dir=cache_dir) as temporary_dir:
                 write_stats(stats, Path(temporary_dir))
                 Path(temporary_dir).replace(cache_path)
@@ -147,6 +152,7 @@ def load_or_compute_relative_ee_stats(
 def compute_relative_ee_stats(
     hf_dataset,
     chunk_size: int,
+    rot_repr: RotationRepresentation,
     identity_rot6d: bool = False,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Compute statistics for the model-facing 10D EE action and state.
@@ -184,7 +190,7 @@ def compute_relative_ee_stats(
         episode_actions = torch.from_numpy(actions[start:end])
         episode_states = torch.from_numpy(states[start:end])
 
-        state_stats.update(ee_to_rot6d(episode_states).numpy())
+        state_stats.update(ee_to_rot_repr(episode_states, rot_repr).numpy())
 
         for batch_start in range(0, num_frames, 20_000):
             base_indices = torch.arange(batch_start, min(batch_start + 20_000, num_frames))
@@ -192,7 +198,7 @@ def compute_relative_ee_stats(
             valid = target_indices < num_frames
             targets = episode_actions[target_indices[valid]]
             references = episode_states[base_indices[:, None].expand_as(target_indices)[valid]]
-            relative_actions = absolute_ee_to_relative(references, targets)
+            relative_actions = absolute_ee_to_relative(references, targets, rot_repr)
             action_stats.update(relative_actions.numpy())
             num_action_targets += len(relative_actions)
 

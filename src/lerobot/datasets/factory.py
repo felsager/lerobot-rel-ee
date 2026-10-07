@@ -26,6 +26,7 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.compute_rel_ee_stats import load_or_compute_relative_ee_stats
 from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
+from lerobot.utils.rotation_representations import RotationRepresentation
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -123,6 +124,7 @@ def _prepare_relative_ee_stats(
     dataset: LeRobotDataset,
     chunk_size: int,
     stats: dict | None = None,
+    rot_repr: RotationRepresentation = None,
     identity_rot6d: bool = False,
 ) -> dict:
     derived_stats = (
@@ -130,6 +132,7 @@ def _prepare_relative_ee_stats(
             dataset.hf_dataset,
             chunk_size,
             cache_dir=dataset.root / "meta" / "relative_ee_stats",
+            rot_repr=rot_repr,
             identity_rot6d=identity_rot6d,
         )
         if stats is None
@@ -141,6 +144,7 @@ def _prepare_relative_ee_stats(
 
 def _relative_ee_stats_kwargs(cfg: TrainPipelineConfig) -> dict:
     return {
+        "rot_repr": cfg.trainable_config.rotation_representation,
         "identity_rot6d": bool(getattr(cfg.trainable_config, "rot6d_identity_norm", False)),
     }
 
