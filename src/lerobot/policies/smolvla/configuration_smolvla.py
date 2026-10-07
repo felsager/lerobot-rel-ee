@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_IMAGES
+from lerobot.utils.rotation_representations import RotationRepresentation
 
 from ..rtc.configuration_rtc import RTCConfig
 
@@ -30,6 +31,7 @@ class SmolVLAConfig(PreTrainedConfig):
     n_action_steps: int = 50
 
     use_relative_ee: bool = False  # Anchor EE actions to the current state.
+    rotation_representation: RotationRepresentation = RotationRepresentation.quaternion
     rot6d_identity_norm: bool = (
         False  # Compute stats that leave action/state rot6d unchanged by normalization.
     )
@@ -120,7 +122,10 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("Relative EE mode requires n_obs_steps=1")
             if self.max_state_dim < 10 or self.max_action_dim < 10:
                 raise ValueError("Relative EE mode requires max_state_dim>=10 and max_action_dim>=10")
-
+        if self.rot6d_identity_norm and self.rotation_representation != RotationRepresentation.rot6d:
+            raise ValueError(
+                f"Using rot6d_identity_norm requires the rotation representation to be {RotationRepresentation.rot6d}"
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

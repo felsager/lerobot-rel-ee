@@ -28,13 +28,22 @@ from lerobot.processor.relative_ee_action_processor import (
     AbsoluteEEActionsStep,
     EEStateStep,
     RelativeEEActionsStep,
-    ee_to_rot6d,
+    ee_to_rot_repr,
     quat_to_rotmat,
     rot6d_to_rotmat,
+    rot_repr_to_rotmat,
+    rotmat_to_rotvec_4d,
+    rotvec_4d_to_rotmat,
     to_absolute_ee_actions,
     to_relative_ee_actions,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation
+
+ROT6D = RotationRepresentation.rot6d
+SUPPORTED_REPRESENTATIONS = [
+    representation for representation in RotationRepresentation if ROT_REPR_DIM[representation] is not None
+]
 
 
 def _random_ee(*shape: int) -> torch.Tensor:
@@ -77,44 +86,50 @@ def _homogeneous(ee: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def test_relative_ee_roundtrip_chunk():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_roundtrip_chunk(rot_repr):
     torch.manual_seed(0)
     state, actions = _random_ee(4), _random_ee(4, 50)
-    relative = to_relative_ee_actions(actions, state)
-    assert relative.shape == (4, 50, 10)
-    _assert_same_ee(to_absolute_ee_actions(relative, state), actions)
+    relative = to_relative_ee_actions(actions, state, rot_repr=rot_repr)
+    assert relative.shape == (4, 50, 4 + ROT_REPR_DIM[rot_repr])
+    _assert_same_ee(to_absolute_ee_actions(relative, state, rot_repr=rot_repr), actions)
 
 
-def test_relative_ee_pairs_each_sample_with_its_own_state_when_batch_equals_horizon():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_pairs_each_sample_with_its_own_state_when_batch_equals_horizon(rot_repr):
     # A round trip alone can't catch wrong pairing: decoding undoes the same mistake.
     torch.manual_seed(1)
     state, actions = _random_ee(8), _random_ee(8, 8)
-    batched = to_relative_ee_actions(actions, state)
-    per_sample = torch.cat([to_relative_ee_actions(actions[i : i + 1], state[i : i + 1]) for i in range(8)])
+    batched = to_relative_ee_actions(actions, state, rot_repr=rot_repr)
+    per_sample = torch.cat(
+        [to_relative_ee_actions(actions[i : i + 1], state[i : i + 1], rot_repr=rot_repr) for i in range(8)]
+    )
     torch.testing.assert_close(batched, per_sample, atol=1e-6, rtol=0)
-    _assert_same_ee(to_absolute_ee_actions(batched, state), actions)
+    _assert_same_ee(to_absolute_ee_actions(batched, state, rot_repr=rot_repr), actions)
 
 
-def test_relative_ee_single_action_decode_matches_chunk_decode():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_single_action_decode_matches_chunk_decode(rot_repr):
     torch.manual_seed(2)
     state, actions = _random_ee(4), _random_ee(4, 50)
-    relative = to_relative_ee_actions(actions, state)
-    chunk = to_absolute_ee_actions(relative, state)
+    relative = to_relative_ee_actions(actions, state, rot_repr=rot_repr)
+    chunk = to_absolute_ee_actions(relative, state, rot_repr=rot_repr)
     for t in (0, 17, 49):
-        _assert_same_ee(to_absolute_ee_actions(relative[:, t], state), chunk[:, t])
+        _assert_same_ee(to_absolute_ee_actions(relative[:, t], state, rot_repr=rot_repr), chunk[:, t])
 
 
-def test_relative_ee_gripper_down_roundtrip_with_mixed_quaternion_signs():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_gripper_down_roundtrip_with_mixed_quaternion_signs(rot_repr):
     torch.manual_seed(3)
     state, actions = _gripper_down_ee(4), _gripper_down_ee(4, 50)
-    relative = to_relative_ee_actions(actions, state)
-    _assert_same_ee(to_absolute_ee_actions(relative, state), actions)
+    relative = to_relative_ee_actions(actions, state, rot_repr=rot_repr)
+    _assert_same_ee(to_absolute_ee_actions(relative, state, rot_repr=rot_repr), actions)
     # q and -q are the same rotation, so flipping every sign must not change the encoding.
     flipped_state, flipped_actions = state.clone(), actions.clone()
     flipped_state[..., 3:7] *= -1
     flipped_actions[..., 3:7] *= -1
     torch.testing.assert_close(
-        to_relative_ee_actions(flipped_actions, flipped_state), relative, atol=1e-6, rtol=0
+        to_relative_ee_actions(flipped_actions, flipped_state, rot_repr=rot_repr), relative, atol=1e-6, rtol=0
     )
 
 
@@ -125,7 +140,9 @@ def test_relative_ee_pose_relative_to_itself_is_identity():
     expected = torch.cat(
         [torch.zeros(4, 3), torch.tensor([1.0, 0, 0, 1, 0, 0]).expand(4, 6), state[:, 7:]], dim=-1
     )
-    torch.testing.assert_close(to_relative_ee_actions(state, state), expected, atol=1e-5, rtol=0)
+    torch.testing.assert_close(
+        to_relative_ee_actions(state, state, rot_repr=ROT6D), expected, atol=1e-5, rtol=0
+    )
 
 
 def test_relative_ee_known_values_pin_frame_and_6d_layout():
@@ -135,21 +152,25 @@ def test_relative_ee_known_values_pin_frame_and_6d_layout():
     reference = torch.tensor([[0.0, 0, 0, 0, 0, 0, 1, 0.3]])
     target = torch.tensor([[0.0, 0, 0, 0, 0, s, s, 0.7]])
     expected = torch.tensor([[0.0, 0, 0, 0, -1, 1, 0, 0, 0, 0.7]])
-    torch.testing.assert_close(to_relative_ee_actions(target, reference), expected, atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        to_relative_ee_actions(target, reference, rot_repr=ROT6D), expected, atol=1e-6, rtol=0
+    )
 
     # EE frame: the reference gripper is turned +90 deg about z, so its x-axis points along base +y.
     # A target 1 m along base +y is therefore 1 m along the gripper's own x-axis.
     reference = torch.tensor([[1.0, 0, 0, 0, 0, s, s, 0.3]])
     target = torch.tensor([[1.0, 1, 0, 0, 0, s, s, 0.7]])
     expected = torch.tensor([[1.0, 0, 0, 1, 0, 0, 1, 0, 0, 0.7]])
-    torch.testing.assert_close(to_relative_ee_actions(target, reference), expected, atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        to_relative_ee_actions(target, reference, rot_repr=ROT6D), expected, atol=1e-6, rtol=0
+    )
 
 
 def test_relative_ee_matches_inverse_reference_transform():
     # Pins the convention itself: EE frame, T_rel = inv(T_ref) @ T. A round trip can't.
     torch.manual_seed(5)
     state, actions = _random_ee(4), _random_ee(4, 50)
-    relative = to_relative_ee_actions(actions, state)
+    relative = to_relative_ee_actions(actions, state, rot_repr=ROT6D)
     expected = torch.linalg.inv(_homogeneous(state))[:, None] @ _homogeneous(actions)
     torch.testing.assert_close(relative[..., :3].double(), expected[..., :3, 3], atol=1e-5, rtol=0)
     torch.testing.assert_close(
@@ -162,20 +183,23 @@ def test_relative_ee_matches_inverse_reference_transform():
 # ---------------------------------------------------------------------------
 
 
-def test_relative_ee_training_transition_through_steps():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_training_transition_through_steps(rot_repr):
     # SmolVLA loads observation frames [0], so the training state arrives as [B, 1, 8].
     torch.manual_seed(6)
     state, actions = _random_ee(2, 1), _random_ee(2, 50)
     actions[:, 0] = state[:, 0]  # first target equals the reference
 
     transition = batch_to_transition({OBS_STATE: state, ACTION: actions})
-    transition = RelativeEEActionsStep(state_frame=0)(transition)
-    transition = EEStateStep()(transition)
+    transition = RelativeEEActionsStep(state_frame=0, rot_repr=rot_repr)(transition)
+    transition = EEStateStep(rot_repr=rot_repr)(transition)
 
     relative = transition[TransitionKey.ACTION]
-    assert relative.shape == (2, 50, 10)
-    assert transition[TransitionKey.OBSERVATION][OBS_STATE].shape == (2, 1, 10)
-    torch.testing.assert_close(relative, to_relative_ee_actions(actions, state[:, 0]), atol=1e-6, rtol=0)
+    assert relative.shape == (2, 50, 4 + ROT_REPR_DIM[rot_repr])
+    assert transition[TransitionKey.OBSERVATION][OBS_STATE].shape == (2, 1, 4 + ROT_REPR_DIM[rot_repr])
+    torch.testing.assert_close(
+        relative, to_relative_ee_actions(actions, state[:, 0], rot_repr=rot_repr), atol=1e-6, rtol=0
+    )
     torch.testing.assert_close(relative[:, 0, :3], torch.zeros(2, 3), atol=1e-5, rtol=0)
 
 
@@ -183,44 +207,51 @@ def test_relative_ee_state_frame_selects_the_current_frame():
     # Diffusion-style observation frames [-1, 0]: the current frame is index 1.
     torch.manual_seed(7)
     state, actions = _random_ee(2, 2), _random_ee(2, 10)
-    transition = RelativeEEActionsStep(state_frame=1)(
+    transition = RelativeEEActionsStep(state_frame=1, rot_repr=ROT6D)(
         batch_to_transition({OBS_STATE: state, ACTION: actions})
     )
     torch.testing.assert_close(
-        transition[TransitionKey.ACTION], to_relative_ee_actions(actions, state[:, 1]), atol=1e-6, rtol=0
+        transition[TransitionKey.ACTION],
+        to_relative_ee_actions(actions, state[:, 1], rot_repr=ROT6D),
+        atol=1e-6,
+        rtol=0,
     )
 
 
 def test_relative_ee_stacked_state_without_state_frame_raises():
     transition = batch_to_transition({OBS_STATE: _random_ee(2, 1), ACTION: _random_ee(2, 10)})
     with pytest.raises(ValueError, match="state_frame is unset"):
-        RelativeEEActionsStep()(transition)
+        RelativeEEActionsStep(rot_repr=ROT6D)(transition)
 
 
-def test_ee_state_step_matches_ee_to_rot6d():
-    # The stats are computed with ee_to_rot6d, so the step must produce exactly the same values.
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_ee_state_step_matches_ee_to_rot_repr(rot_repr):
+    # The stats are computed with ee_to_rot_repr, so the step must produce exactly the same values.
     state = _random_ee(3)
-    stepped = EEStateStep()(batch_to_transition({OBS_STATE: state}))[TransitionKey.OBSERVATION][OBS_STATE]
-    torch.testing.assert_close(stepped, ee_to_rot6d(state), atol=0, rtol=0)
+    stepped = EEStateStep(rot_repr=rot_repr)(batch_to_transition({OBS_STATE: state}))[
+        TransitionKey.OBSERVATION
+    ][OBS_STATE]
+    torch.testing.assert_close(stepped, ee_to_rot_repr(state, rot_repr=rot_repr), atol=0, rtol=0)
 
 
-def test_absolute_ee_step_decodes_against_cached_reference():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_absolute_ee_step_decodes_against_cached_reference(rot_repr):
     torch.manual_seed(8)
-    relative_step = RelativeEEActionsStep()
+    relative_step = RelativeEEActionsStep(rot_repr=rot_repr)
     absolute_step = AbsoluteEEActionsStep(relative_step=relative_step)
     state = _random_ee(1)
-    relative_action = to_relative_ee_actions(_random_ee(1), state)
+    relative_action = to_relative_ee_actions(_random_ee(1), state, rot_repr=rot_repr)
 
     relative_step(
         batch_to_transition({OBS_STATE: state})
     )  # inference preprocess: no action, caches the state
     decoded = absolute_step(batch_to_transition({ACTION: relative_action}))[TransitionKey.ACTION]
 
-    _assert_same_ee(decoded, to_absolute_ee_actions(relative_action, state))
+    _assert_same_ee(decoded, to_absolute_ee_actions(relative_action, state, rot_repr=rot_repr))
 
 
 def test_relative_ee_reference_is_held_while_chunk_is_in_flight():
-    relative_step = RelativeEEActionsStep()
+    relative_step = RelativeEEActionsStep(rot_repr=ROT6D)
     queue = {"size": 0}
     policy = SimpleNamespace(count_queued_actions=lambda: queue["size"])
     assert bind_relative_anchor(policy, SimpleNamespace(steps=[relative_step])) is relative_step
@@ -235,29 +266,42 @@ def test_relative_ee_reference_is_held_while_chunk_is_in_flight():
     torch.testing.assert_close(relative_step.get_cached_state(), third, atol=0, rtol=0)
 
 
-def test_relative_ee_steps_get_config_roundtrip():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_steps_get_config_roundtrip(rot_repr):
     # Loading a saved pipeline rebuilds each step from its get_config().
-    for step in (RelativeEEActionsStep(state_frame=0), EEStateStep(), AbsoluteEEActionsStep()):
+    for step in (
+        RelativeEEActionsStep(state_frame=0, rot_repr=rot_repr),
+        EEStateStep(rot_repr=rot_repr),
+        AbsoluteEEActionsStep(),
+    ):
         rebuilt = type(step)(**step.get_config())
         assert rebuilt.get_config() == step.get_config()
-    assert RelativeEEActionsStep(**RelativeEEActionsStep(state_frame=1).get_config()).state_frame == 1
+    assert (
+        RelativeEEActionsStep(
+            **RelativeEEActionsStep(state_frame=1, rot_repr=rot_repr).get_config()
+        ).state_frame
+        == 1
+    )
 
 
-def test_relative_ee_steps_transform_features():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_steps_transform_features(rot_repr):
     features = {
         PipelineFeatureType.OBSERVATION: {OBS_STATE: PolicyFeature(FeatureType.STATE, (8,))},
         PipelineFeatureType.ACTION: {ACTION: PolicyFeature(FeatureType.ACTION, (8,))},
     }
-    model_side = EEStateStep().transform_features(RelativeEEActionsStep().transform_features(features))
-    assert model_side[PipelineFeatureType.OBSERVATION][OBS_STATE].shape == (10,)
-    assert model_side[PipelineFeatureType.ACTION][ACTION].shape == (10,)
+    model_side = EEStateStep(rot_repr=rot_repr).transform_features(
+        RelativeEEActionsStep(rot_repr=rot_repr).transform_features(features)
+    )
+    assert model_side[PipelineFeatureType.OBSERVATION][OBS_STATE].shape == (4 + ROT_REPR_DIM[rot_repr],)
+    assert model_side[PipelineFeatureType.ACTION][ACTION].shape == (4 + ROT_REPR_DIM[rot_repr],)
 
     robot_side = AbsoluteEEActionsStep().transform_features(model_side)
     assert robot_side[PipelineFeatureType.ACTION][ACTION].shape == (8,)
 
     # Disabled steps leave the declared shapes alone, and the input is never mutated.
-    assert RelativeEEActionsStep(enabled=False).transform_features(features) == features
-    assert EEStateStep(enabled=False).transform_features(features) == features
+    assert RelativeEEActionsStep(enabled=False, rot_repr=rot_repr).transform_features(features) == features
+    assert EEStateStep(enabled=False, rot_repr=rot_repr).transform_features(features) == features
     assert features[PipelineFeatureType.ACTION][ACTION].shape == (8,)
 
 
@@ -278,19 +322,26 @@ def test_relative_ee_stats_cache_key(monkeypatch: pytest.MonkeyPatch) -> None:
     states = actions.copy()
     episodes = np.array([0, 0])
     key = stats_module.relative_ee_stats_cache_key
-    original = key(actions, states, episodes, 50)
-    assert original == key(actions.copy(), states.copy(), episodes.copy(), 50)
-    assert original == key(actions.astype(np.float64), np.asfortranarray(states), episodes, 50)
-    assert original != key(actions, states, episodes, 25)
+    original = key(actions, states, episodes, 50, rotation_representation=ROT6D)
+    assert original == key(actions.copy(), states.copy(), episodes.copy(), 50, rotation_representation=ROT6D)
+    assert original == key(
+        actions.astype(np.float64), np.asfortranarray(states), episodes, 50, rotation_representation=ROT6D
+    )
+    assert original != key(actions, states, episodes, 25, rotation_representation=ROT6D)
+    assert len(
+        {key(actions, states, episodes, 50, rotation_representation=r) for r in SUPPORTED_REPRESENTATIONS}
+    ) == len(SUPPORTED_REPRESENTATIONS)
     changed = actions.copy()
     changed[0, 0] += 0.1
-    assert original != key(changed, states, episodes, 50)
-    assert original != key(actions, changed, episodes, 50)
-    assert original != key(actions, states, np.array([0, 1]), 50)
-    assert original != key(actions[:1], states[:1], episodes[:1], 50)
-    assert original != key(actions[::-1], states[::-1], episodes[::-1], 50)
-    monkeypatch.setattr(stats_module, "_RELATIVE_EE_STATS_VERSION", 2)
-    assert original != key(actions, states, episodes, 50)
+    assert original != key(changed, states, episodes, 50, rotation_representation=ROT6D)
+    assert original != key(actions, changed, episodes, 50, rotation_representation=ROT6D)
+    assert original != key(actions, states, np.array([0, 1]), 50, rotation_representation=ROT6D)
+    assert original != key(actions[:1], states[:1], episodes[:1], 50, rotation_representation=ROT6D)
+    assert original != key(actions[::-1], states[::-1], episodes[::-1], 50, rotation_representation=ROT6D)
+    monkeypatch.setattr(
+        stats_module, "_RELATIVE_EE_STATS_VERSION", stats_module._RELATIVE_EE_STATS_VERSION + 1
+    )
+    assert original != key(actions, states, episodes, 50, rotation_representation=ROT6D)
 
 
 def test_relative_ee_stats_cache_reuse(tmp_path: Path) -> None:
@@ -304,21 +355,22 @@ def test_relative_ee_stats_cache_reuse(tmp_path: Path) -> None:
     with patch(
         "lerobot.datasets.compute_rel_ee_stats.compute_relative_ee_stats", wraps=compute_relative_ee_stats
     ) as compute:
-        raw = load_or_compute_relative_ee_stats(data, 2, tmp_path)
-        identity = load_or_compute_relative_ee_stats(data, 2, tmp_path, identity_rot6d=True)
-        loaded = load_or_compute_relative_ee_stats(data, 2, tmp_path)
+        raw = load_or_compute_relative_ee_stats(data, 2, tmp_path, rot_repr=ROT6D)
+        identity = load_or_compute_relative_ee_stats(data, 2, tmp_path, identity_rot6d=True, rot_repr=ROT6D)
+        loaded = load_or_compute_relative_ee_stats(data, 2, tmp_path, rot_repr=ROT6D)
         assert compute.call_count == 1
         for key in (ACTION, OBS_STATE):
             for name in raw[key]:
                 np.testing.assert_array_equal(loaded[key][name], raw[key][name])
             np.testing.assert_array_equal(identity[key]["mean"][3:9], 0)
             np.testing.assert_array_equal(identity[key]["std"][3:9], 1)
-        load_or_compute_relative_ee_stats(data, 1, tmp_path)
+        load_or_compute_relative_ee_stats(data, 1, tmp_path, rot_repr=ROT6D)
         assert compute.call_count == 2
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_relative_ee_stats_anchor_on_state_and_stay_within_episodes():
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_stats_anchor_on_state_and_stay_within_episodes(rot_repr):
     # Imported here so the tests above still run without the dataset extra installed.
     from lerobot.datasets.compute_rel_ee_stats import compute_relative_ee_stats
 
@@ -329,14 +381,16 @@ def test_relative_ee_stats_anchor_on_state_and_stay_within_episodes():
         [_ee_x(0.0, 0.0), _ee_x(0.5, 0.2), _ee_x(10.0, 0.4), _ee_x(10.5, 0.6)], dtype=np.float32
     )
     stats = compute_relative_ee_stats(
-        {ACTION: actions, OBS_STATE: states, "episode_index": np.array([0, 0, 1, 1])}, chunk_size=2
+        {ACTION: actions, OBS_STATE: states, "episode_index": np.array([0, 0, 1, 1])},
+        chunk_size=2,
+        rot_repr=rot_repr,
     )
     # Per episode: (0, 1) from t=0 and (0.5) from t=1; the target past the episode end is excluded.
     # Anchoring on the action instead of the state would give (0, 1) and (0), so a mean of 1/3.
     np.testing.assert_allclose(stats[ACTION]["mean"][0], 0.5, atol=1e-6)
     np.testing.assert_allclose(stats[OBS_STATE]["mean"][0], (0 + 0.5 + 10 + 10.5) / 4, atol=1e-6)
-    assert stats[ACTION]["mean"].shape == (10,)
-    assert stats[OBS_STATE]["mean"].shape == (10,)
+    assert stats[ACTION]["mean"].shape == (4 + ROT_REPR_DIM[rot_repr],)
+    assert stats[OBS_STATE]["mean"].shape == (4 + ROT_REPR_DIM[rot_repr],)
 
 
 def test_relative_ee_stats_identity_rot6d():
@@ -349,6 +403,7 @@ def test_relative_ee_stats_identity_rot6d():
         {ACTION: actions, OBS_STATE: actions.copy(), "episode_index": np.array([0, 0, 1, 1])},
         chunk_size=2,
         identity_rot6d=True,
+        rot_repr=ROT6D,
     )
     for key in (ACTION, OBS_STATE):
         np.testing.assert_allclose(stats[key]["min"][3:9], -1.0)
@@ -360,7 +415,7 @@ def test_relative_ee_stats_identity_rot6d():
 @pytest.mark.parametrize("selection", [None, [1, 2], [3, 0, 3, 1]])
 @pytest.mark.parametrize("formatter", [None, "torch"])
 @pytest.mark.parametrize("fixed", [False, True])
-def test_arrow_relative_columns_preserve_legacy_hash(selection, formatter, fixed):
+def test_arrow_relative_columns_preserve_current_hash(selection, formatter, fixed):
     import hashlib
 
     import pyarrow as pa
@@ -388,14 +443,16 @@ def test_arrow_relative_columns_preserve_legacy_hash(selection, formatter, fixed
     original_format = ds.format.copy()
     actual = _load_relative_ee_columns(ds)
     assert ds.format == original_format
-    legacy = hashlib.sha256(b"relative-ee:1:50")
+    legacy = hashlib.sha256(f"relative-ee:2:50:{ROT6D}".encode())
     for key, dtype in [(ACTION, "<f4"), (OBS_STATE, "<f4"), ("episode_index", "<i8")]:
         np.testing.assert_array_equal(actual[key], expected[key])
         values = np.ascontiguousarray(expected[key], dtype=dtype)
         legacy.update(f"{key}:{values.shape}:{dtype}:".encode())
         legacy.update(values.tobytes())
     assert (
-        relative_ee_stats_cache_key(actual[ACTION], actual[OBS_STATE], actual["episode_index"], 50)
+        relative_ee_stats_cache_key(
+            actual[ACTION], actual[OBS_STATE], actual["episode_index"], 50, rotation_representation=ROT6D
+        )
         == legacy.hexdigest()
     )
 
@@ -407,26 +464,26 @@ def test_arrow_relative_cache_hits_existing_cache(tmp_path):
 
     poses = np.array([_ee_x(0, 0), _ee_x(1, 1)], dtype=np.float32)
     columns = {ACTION: poses, OBS_STATE: poses.copy(), "episode_index": np.array([0, 0])}
-    expected = load_or_compute_relative_ee_stats(columns, 2, tmp_path)
+    expected = load_or_compute_relative_ee_stats(columns, 2, tmp_path, rot_repr=ROT6D)
     dataset = Dataset.from_dict(columns).with_format("torch")
     with patch(
         "lerobot.datasets.compute_rel_ee_stats.compute_relative_ee_stats",
         side_effect=AssertionError("cache miss"),
     ):
-        actual = load_or_compute_relative_ee_stats(dataset, 2, tmp_path)
+        actual = load_or_compute_relative_ee_stats(dataset, 2, tmp_path, rot_repr=ROT6D)
     for key in expected:
         for stat in expected[key]:
             np.testing.assert_array_equal(expected[key][stat], actual[key][stat])
 
 
-def test_empty_relative_columns_preserve_legacy_hash() -> None:
+def test_empty_relative_columns_preserve_current_hash() -> None:
     import hashlib
 
     from lerobot.datasets.compute_rel_ee_stats import relative_ee_stats_cache_key
 
     poses = np.empty((0, 8), dtype=np.float32)
     episodes = np.empty(0, dtype=np.int64)
-    legacy = hashlib.sha256(b"relative-ee:1:50")
+    legacy = hashlib.sha256(f"relative-ee:2:50:{ROT6D}".encode())
     for name, array, dtype in [
         (ACTION, poses, "<f4"),
         (OBS_STATE, poses, "<f4"),
@@ -434,4 +491,78 @@ def test_empty_relative_columns_preserve_legacy_hash() -> None:
     ]:
         legacy.update(f"{name}:{array.shape}:{dtype}:".encode())
         legacy.update(array.tobytes())
-    assert relative_ee_stats_cache_key(poses, poses, episodes, 50) == legacy.hexdigest()
+    assert (
+        relative_ee_stats_cache_key(poses, poses, episodes, 50, rotation_representation=ROT6D)
+        == legacy.hexdigest()
+    )
+
+
+@pytest.mark.parametrize("shape", [(), (2,), (2, 3)])
+def test_axis_angle_4d_identity_is_finite_and_zero(shape):
+    matrices = torch.eye(3).expand(*shape, 3, 3)
+    encoded = rotmat_to_rotvec_4d(matrices)
+    assert encoded.shape == (*shape, 4)
+    torch.testing.assert_close(encoded, torch.zeros_like(encoded), atol=0, rtol=0)
+    torch.testing.assert_close(rotvec_4d_to_rotmat(encoded), matrices)
+
+
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_geometry_matches_transform_for_each_representation(rot_repr):
+    torch.manual_seed(12)
+    state, actions = _random_ee(3), _random_ee(3, 5)
+    relative = to_relative_ee_actions(actions, state, rot_repr)
+    expected = torch.linalg.inv(_homogeneous(state))[:, None] @ _homogeneous(actions)
+    torch.testing.assert_close(relative[..., :3].double(), expected[..., :3, 3], atol=1e-5, rtol=0)
+    torch.testing.assert_close(
+        rot_repr_to_rotmat[rot_repr](relative[..., 3:-1]).double(),
+        expected[..., :3, :3],
+        atol=1e-5,
+        rtol=0,
+    )
+    converted_state = ee_to_rot_repr(state, rot_repr)
+    torch.testing.assert_close(
+        rot_repr_to_rotmat[rot_repr](converted_state[..., 3:-1]),
+        quat_to_rotmat(state[..., 3:7]),
+        atol=1e-5,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_relative_ee_statistics_match_model_samples(rot_repr):
+    from lerobot.datasets.compute_rel_ee_stats import compute_relative_ee_stats
+
+    torch.manual_seed(13)
+    states, actions = _random_ee(4), _random_ee(4)
+    data = {ACTION: actions.numpy(), OBS_STATE: states.numpy(), "episode_index": np.zeros(4, dtype=np.int64)}
+    stats = compute_relative_ee_stats(data, 2, rot_repr)
+    action_samples = torch.cat(
+        [to_relative_ee_actions(actions[t : min(t + 2, 4)], states[t], rot_repr) for t in range(4)]
+    ).numpy()
+    state_samples = ee_to_rot_repr(states, rot_repr).numpy()
+    for key, samples in [(ACTION, action_samples), (OBS_STATE, state_samples)]:
+        for name, expected in [
+            ("mean", samples.mean(axis=0)),
+            ("min", samples.min(axis=0)),
+            ("max", samples.max(axis=0)),
+        ]:
+            np.testing.assert_allclose(stats[key][name], expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("step_type", [RelativeEEActionsStep, EEStateStep])
+def test_ee_representation_is_required(step_type):
+    with pytest.raises(TypeError):
+        step_type()
+
+
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_rotation_decoder_identity(rot_repr):
+    encodings = {
+        RotationRepresentation.quaternion: [0.0, 0, 0, 1],
+        RotationRepresentation.euler_angles: [0.0, 0, 0],
+        RotationRepresentation.rot6d: [1.0, 0, 0, 1, 0, 0],
+        RotationRepresentation.axis_angle_3d: [0.0, 0, 0],
+        RotationRepresentation.axis_angle_4d: [0.0, 0, 0, 0],
+    }
+    decoded = rot_repr_to_rotmat[rot_repr](torch.tensor(encodings[rot_repr]).expand(2, -1))
+    torch.testing.assert_close(decoded, torch.eye(3).expand(2, 3, 3))

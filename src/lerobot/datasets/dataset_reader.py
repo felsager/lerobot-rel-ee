@@ -15,6 +15,8 @@
 # limitations under the License.
 """Private reader component for LeRobotDataset. Handles random-access reading (HF dataset, delta indices, video decoding)."""
 
+import logging
+import random
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -41,7 +43,55 @@ from .io_utils import (
     load_nested_dataset,
 )
 from .utils import resolve_episode_indices
-from .video_utils import decode_video_frames
+from .video_utils import VideoDecoderCache, decode_video_frames, decode_video_frames_torchcodec
+
+logger = logging.getLogger(__name__)
+
+
+class InvalidLocalVideoError(RuntimeError):
+    """Video input still fails after a fresh TorchCodec decoder retry."""
+
+
+def _decode_local_video(
+    video_path: Path,
+    timestamps: list[float],
+    tolerance_s: float,
+    backend: str | None,
+    *,
+    return_uint8: bool,
+    is_depth: bool,
+) -> torch.Tensor:
+    try:
+        return decode_video_frames(
+            video_path, timestamps, tolerance_s, backend, return_uint8=return_uint8, is_depth=is_depth
+        )
+    except RuntimeError as error:
+        if (
+            "Invalid data found when processing input" not in str(error)
+            or "decoder" not in str(error).lower()
+        ):
+            raise
+        logger.warning(
+            "Retrying local video with fresh TorchCodec decoder: video=%s timestamps=%s error=%s",
+            video_path,
+            timestamps,
+            error,
+        )
+    cache = VideoDecoderCache()
+    try:
+        try:
+            return decode_video_frames_torchcodec(
+                video_path, timestamps, tolerance_s, decoder_cache=cache, return_uint8=return_uint8
+            )
+        except RuntimeError as error:
+            if (
+                "Invalid data found when processing input" not in str(error)
+                or "decoder" not in str(error).lower()
+            ):
+                raise
+            raise InvalidLocalVideoError(f"video={video_path}; timestamps={timestamps}; error={error}") from error
+    finally:
+        cache.clear()
 
 
 class BaseDatasetReader(ABC):
@@ -394,7 +444,7 @@ class DatasetReader(BaseDatasetReader):
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
             video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(
+            frames = _decode_local_video(
                 video_path,
                 shifted_query_ts,
                 self._tolerance_s,
@@ -426,6 +476,31 @@ class DatasetReader(BaseDatasetReader):
             return dict(f.result() for f in futures)
 
     def get_item(self, idx: int) -> dict:
+        """Replace an undecodable row with a complete valid row, keeping batch size stable."""
+        try:
+            return self._get_item(idx)
+        except InvalidLocalVideoError as error:
+            logger.warning("Replacing invalid local sample: index=%s %s", idx, error)
+        hf_dataset = self.hf_dataset
+        if hf_dataset is None:
+            raise RuntimeError("Dataset is not loaded")
+        total = len(hf_dataset)
+        # Worker Python RNG is seeded by DataLoader. Avoid reusing the failed row.
+        candidates = random.sample(range(total - 1), min(20, total - 1))
+        for candidate in candidates:
+            candidate += candidate >= idx
+            try:
+                return self._get_item(candidate)
+            except InvalidLocalVideoError as error:
+                logger.warning(
+                    "Replacement local sample also invalid: requested=%s candidate=%s %s",
+                    idx,
+                    candidate,
+                    error,
+                )
+        raise RuntimeError(f"No decodable replacement for index={idx} after {len(candidates)} attempts")
+
+    def _get_item(self, idx: int) -> dict:
         """Core __getitem__ logic. Loads hf_dataset on first access.
 
         ``idx`` is a *relative* index into the (possibly episode-filtered)

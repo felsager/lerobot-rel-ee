@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -28,20 +29,33 @@ from lerobot.processor import (  # noqa: E402
     EEStateStep,
     NormalizerProcessorStep,
     RelativeEEActionsStep,
+    TransitionKey,
+    batch_to_transition,
     tokenizer_processor,
 )
+from lerobot.processor.relative_ee_action_processor import quat_to_rotmat  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
+from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation  # noqa: E402
+
+SUPPORTED_REPRESENTATIONS = [r for r in RotationRepresentation if ROT_REPR_DIM[r] is not None]
 
 
-def _model_space_stats() -> dict[str, dict[str, torch.Tensor]]:
-    stats = {"mean": torch.zeros(10), "std": torch.ones(10), "min": -torch.ones(10), "max": torch.ones(10)}
+def _model_space_stats(rot_repr: RotationRepresentation) -> dict[str, dict[str, torch.Tensor]]:
+    dim = 4 + ROT_REPR_DIM[rot_repr]
+    stats = {
+        "mean": torch.zeros(dim),
+        "std": torch.ones(dim),
+        "min": -torch.ones(dim),
+        "max": torch.ones(dim),
+    }
     return {OBS_STATE: dict(stats), ACTION: dict(stats)}
 
 
-def _relative_ee_smolvla_config() -> SmolVLAConfig:
-    config = SmolVLAConfig(use_relative_ee=True, device="cpu")
-    config.input_features = {OBS_STATE: PolicyFeature(FeatureType.STATE, (10,))}
-    config.output_features = {ACTION: PolicyFeature(FeatureType.ACTION, (10,))}
+def _relative_ee_smolvla_config(rot_repr: RotationRepresentation) -> SmolVLAConfig:
+    config = SmolVLAConfig(use_relative_ee=True, device="cpu", rotation_representation=rot_repr)
+    dim = 4 + ROT_REPR_DIM[rot_repr]
+    config.input_features = {OBS_STATE: PolicyFeature(FeatureType.STATE, (dim,))}
+    config.output_features = {ACTION: PolicyFeature(FeatureType.ACTION, (dim,))}
     return config
 
 
@@ -49,16 +63,23 @@ def _step(pipeline, step_type):
     return next(step for step in pipeline.steps if isinstance(step, step_type))
 
 
+class _FakeTokenizer:
+    def save_pretrained(self, save_directory: Path) -> None:
+        save_directory.mkdir(parents=True, exist_ok=True)
+        (save_directory / "tokenizer_config.json").write_text("{}")
+
+
 @pytest.fixture(autouse=True)
 def _no_tokenizer_download(monkeypatch):
     monkeypatch.setattr(
-        tokenizer_processor.AutoTokenizer, "from_pretrained", lambda *_args, **_kwargs: object()
+        tokenizer_processor.AutoTokenizer, "from_pretrained", lambda *_args, **_kwargs: _FakeTokenizer()
     )
 
 
-def test_smolvla_relative_ee_pipeline_composition():
-    config = _relative_ee_smolvla_config()
-    preprocessor, postprocessor = make_smolvla_pre_post_processors(config, _model_space_stats())
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_smolvla_relative_ee_pipeline_composition(rot_repr):
+    config = _relative_ee_smolvla_config(rot_repr)
+    preprocessor, postprocessor = make_smolvla_pre_post_processors(config, _model_space_stats(rot_repr))
 
     pre_types = [type(step) for step in preprocessor.steps]
     relative_step = _step(preprocessor, RelativeEEActionsStep)
@@ -72,12 +93,15 @@ def test_smolvla_relative_ee_pipeline_composition():
     )
     assert relative_step.state_frame == config.observation_delta_indices.index(0)
     assert absolute_step.relative_step is relative_step
+    assert relative_step.rot_repr == rot_repr
+    assert _step(preprocessor, EEStateStep).rot_repr == rot_repr
     assert config.action_delta_indices == list(range(config.chunk_size))
 
 
-def test_smolvla_relative_ee_processors_save_load_and_reconnect():
-    config = _relative_ee_smolvla_config()
-    preprocessor, postprocessor = make_smolvla_pre_post_processors(config, _model_space_stats())
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_smolvla_relative_ee_processors_save_load_and_reconnect(rot_repr):
+    config = _relative_ee_smolvla_config(rot_repr)
+    preprocessor, postprocessor = make_smolvla_pre_post_processors(config, _model_space_stats(rot_repr))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         preprocessor.save_pretrained(tmpdir)
@@ -88,6 +112,20 @@ def test_smolvla_relative_ee_processors_save_load_and_reconnect():
     absolute_step = _step(loaded_postprocessor, AbsoluteEEActionsStep)
     assert absolute_step.relative_step is relative_step
     assert relative_step.state_frame == 0
+    assert relative_step.rot_repr == rot_repr
+    assert _step(loaded_preprocessor, EEStateStep).rot_repr == rot_repr
+
+    # Check behavior after deserialization as well as restored configuration.
+    state = torch.tensor([[0.2, -0.1, 0.3, 0, 0, 0, 1, 0.5]])
+    target = torch.tensor([[[0.4, 0.1, 0.2, 0, 0, 0.6, 0.8, 0.7]]])
+    encoded = relative_step(batch_to_transition({OBS_STATE: state, ACTION: target}))[TransitionKey.ACTION]
+    assert encoded.shape == (1, 1, 4 + ROT_REPR_DIM[rot_repr])
+    decoded = absolute_step(batch_to_transition({ACTION: encoded}))[TransitionKey.ACTION]
+    torch.testing.assert_close(decoded[..., :3], target[..., :3], atol=1e-6, rtol=0)
+    torch.testing.assert_close(decoded[..., -1:], target[..., -1:])
+    torch.testing.assert_close(
+        quat_to_rotmat(decoded[..., 3:7]), quat_to_rotmat(target[..., 3:7]), atol=1e-6, rtol=0
+    )
 
 
 def _stats_with_identity_rot6d() -> dict[str, torch.Tensor]:
@@ -134,3 +172,15 @@ def test_identity_rot6d_stats_are_a_noop_under_the_normalizer(mode):
     torch.testing.assert_close(normalized[0, 3:9], action[0, 3:9], atol=1e-6, rtol=0)
     assert not torch.allclose(normalized[0, :3], action[0, :3])
     assert not torch.allclose(normalized[0, 9], action[0, 9])
+
+
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+def test_smolvla_identity_rotation_normalization_requires_rot6d(rot_repr):
+    if rot_repr == RotationRepresentation.rot6d:
+        config = SmolVLAConfig(
+            use_relative_ee=True, rotation_representation=rot_repr, rot6d_identity_norm=True
+        )
+        assert config.rot6d_identity_norm
+    else:
+        with pytest.raises(ValueError, match="rot6d_identity_norm"):
+            SmolVLAConfig(use_relative_ee=True, rotation_representation=rot_repr, rot6d_identity_norm=True)
