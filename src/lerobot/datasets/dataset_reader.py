@@ -89,7 +89,9 @@ def _decode_local_video(
                 or "decoder" not in str(error).lower()
             ):
                 raise
-            raise InvalidLocalVideoError(f"video={video_path}; timestamps={timestamps}; error={error}") from error
+            raise InvalidLocalVideoError(
+                f"video={video_path}; timestamps={timestamps}; error={error}"
+            ) from error
     finally:
         cache.clear()
 
@@ -433,7 +435,12 @@ class DatasetReader(BaseDatasetReader):
             result[key] = torch.stack(self._column_view(key)[relative_indices][key])
         return result
 
-    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+    def _query_videos(
+        self,
+        query_timestamps: dict[str, list[float]],
+        ep_idx: int,
+        camera_masks: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
         Segmentation Fault.
@@ -441,8 +448,32 @@ class DatasetReader(BaseDatasetReader):
         ep = self._meta.episodes[ep_idx]
 
         def _decode_single(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor]:
+            valid = None
+            if camera_masks is not None and vid_key in camera_masks:
+                valid = camera_masks[vid_key].bool().reshape(-1)
+                if valid.numel() != len(query_ts):
+                    raise ValueError(f"{vid_key}_padding_mask must have one validity value per queried frame")
+                # Absent cameras may reference a shared placeholder video with unusable offsets.
+                # Keep the camera slot, but never access that video for masked frames.
+                if not valid.any():
+                    feature = self._meta.features[vid_key]
+                    shape = tuple(feature["shape"])
+                    names = feature.get("names") or ["height", "width", "channels"]
+                    if names[-1] in ("channel", "channels"):
+                        shape = (shape[-1], *shape[:-1])
+                    dtype = (
+                        torch.uint8
+                        if self._return_uint8 and vid_key not in self._meta.depth_keys
+                        else torch.float32
+                    )
+                    return vid_key, torch.zeros((len(query_ts), *shape), dtype=dtype).squeeze(0)
+            decode_ts = (
+                query_ts
+                if valid is None
+                else [ts for ts, keep in zip(query_ts, valid.tolist(), strict=True) if keep]
+            )
             from_timestamp = ep[f"videos/{vid_key}/from_timestamp"]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+            shifted_query_ts = [from_timestamp + ts for ts in decode_ts]
             video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
             frames = _decode_local_video(
                 video_path,
@@ -462,6 +493,10 @@ class DatasetReader(BaseDatasetReader):
                     use_log=depth_encoder.use_log,
                     output_unit=self._depth_output_unit,
                 )
+            if valid is not None and not valid.all():
+                padded_frames = frames.new_zeros((len(query_ts), *frames.shape[1:]))
+                padded_frames[valid] = frames
+                frames = padded_frames
             return vid_key, frames.squeeze(0)
 
         items = list(query_timestamps.items())
@@ -524,7 +559,17 @@ class DatasetReader(BaseDatasetReader):
         if len(self._meta.video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
-            video_frames = self._query_videos(query_timestamps, ep_idx)
+            camera_masks = {}
+            for key in self._meta.video_keys:
+                mask_key = f"{key}_padding_mask"
+                if mask_key not in item:
+                    continue
+                if query_indices is not None and key in query_indices:
+                    # Camera masks need the same history as their images, including when
+                    # the policy has no shared observation_delta_indices (e.g. pi05 MEM).
+                    item[mask_key] = self._query_hf_dataset({mask_key: query_indices[key]})[mask_key]
+                camera_masks[key] = item[mask_key]
+            video_frames = self._query_videos(query_timestamps, ep_idx, camera_masks)
             item = {**video_frames, **item}
 
         if self._image_transforms is not None:

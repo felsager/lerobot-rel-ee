@@ -1259,12 +1259,23 @@ class PI05Policy(PreTrainedPolicy):
 
             images.append(img)
             bsize = img.shape[0]
+            mask_shape = img.shape[:2] if is_video else (bsize,)
+            camera_mask_key = f"{key}_padding_mask"
+            if camera_mask_key in batch:
+                mask = batch[camera_mask_key].to(device=device, dtype=torch.bool)
+                if mask.ndim == len(mask_shape) + 1 and mask.shape[-1] == 1:
+                    mask = mask.squeeze(-1)
+                if is_video and mask.shape in ((bsize,), (bsize, 1)):
+                    mask = mask.reshape(bsize, 1).expand(mask_shape)
+                if mask.shape != mask_shape:
+                    raise ValueError(
+                        f"{camera_mask_key} must have one validity value per image; got {tuple(mask.shape)}"
+                    )
+            else:
+                mask = torch.ones(mask_shape, dtype=torch.bool, device=device)
             pad_key = f"{key}_is_pad"
             if is_video and pad_key in batch:
-                mask = ~batch[pad_key].bool()
-            else:
-                mask_shape = img.shape[:2] if is_video else (bsize,)
-                mask = torch.ones(mask_shape, dtype=torch.bool, device=device)
+                mask = mask & ~batch[pad_key].to(device=device, dtype=torch.bool)
             img_masks.append(mask)
 
         # Create image features not present in the batch as fully 0 padded images

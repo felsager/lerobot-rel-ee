@@ -18,11 +18,14 @@
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+
+from datasets import Dataset
 
 from lerobot.datasets import LeRobotDataset, register_dataset_reader
 from lerobot.datasets.dataset_reader import DatasetReader
@@ -31,6 +34,111 @@ from lerobot.datasets.storage import _DATASET_READER_MODULES, DEFAULT_STORAGE_FO
 from lerobot.utils.constants import LANGUAGE_EVENTS
 from lerobot.utils.import_utils import get_safe_default_video_backend
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
+
+
+def _masked_camera_reader(tmp_path: Path, *, return_uint8: bool, history: bool = False) -> DatasetReader:
+    cameras = ["observation.images.top", "observation.images.wrist"]
+    episode = {"dataset_from_index": 0, "dataset_to_index": 3}
+    for key in cameras:
+        episode[f"videos/{key}/from_timestamp"] = 0.0 if key.endswith("top") else 100_000.0
+    metadata = types.SimpleNamespace(
+        total_episodes=1,
+        fps=30,
+        video_keys=cameras,
+        camera_keys=cameras,
+        depth_keys=[],
+        image_keys=[],
+        features={
+            key: {"dtype": "video", "shape": (4, 6, 3), "names": ["height", "width", "channels"]}
+            for key in cameras
+        },
+        episodes=[episode],
+        tasks=types.SimpleNamespace(iloc=[types.SimpleNamespace(name="pick the cube")]),
+        get_video_file_path=lambda ep_idx, key: Path(f"{key}.mp4"),
+    )
+    reader = DatasetReader(
+        meta=metadata,
+        root=tmp_path,
+        episodes=None,
+        tolerance_s=1e-4,
+        video_backend="torchcodec",
+        delta_timestamps={key: [-2 / 30, -1 / 30, 0] for key in cameras} if history else None,
+        image_transforms=None,
+        return_uint8=return_uint8,
+    )
+    reader.hf_dataset = Dataset.from_dict(
+        {
+            "index": [0, 1, 2],
+            "episode_index": [0, 0, 0],
+            "timestamp": [0.0, 1 / 30, 2 / 30],
+            "task_index": [0, 0, 0],
+            f"{cameras[0]}_padding_mask": [True, True, True],
+            f"{cameras[1]}_padding_mask": [False, False, False],
+        }
+    )
+    reader.hf_dataset.set_transform(hf_transform_to_torch)
+    return reader
+
+
+@pytest.mark.parametrize("return_uint8", [False, True])
+@pytest.mark.parametrize("history", [False, True])
+def test_masked_camera_skips_invalid_placeholder_video(tmp_path, monkeypatch, return_uint8, history):
+    reader = _masked_camera_reader(tmp_path, return_uint8=return_uint8, history=history)
+    decoded = []
+
+    def decode(path, timestamps, tolerance_s, backend, *, return_uint8, is_depth):
+        assert str(path).endswith("top.mp4"), "masked wrist camera must never be decoded"
+        decoded.append(timestamps)
+        dtype = torch.uint8 if return_uint8 else torch.float32
+        return torch.ones(len(timestamps), 3, 4, 6, dtype=dtype)
+
+    monkeypatch.setattr("lerobot.datasets.dataset_reader._decode_local_video", decode)
+    item = reader.get_item(2)
+    expected_shape = (3, 3, 4, 6) if history else (3, 4, 6)
+    wrist = item["observation.images.wrist"]
+    assert wrist.shape == expected_shape
+    assert wrist.dtype == (torch.uint8 if return_uint8 else torch.float32)
+    assert torch.count_nonzero(wrist) == 0
+    assert torch.all(item["observation.images.top"] == 1)
+    assert len(decoded) == 1
+    if history:
+        assert item["observation.images.wrist_padding_mask"].shape == (3,)
+
+
+def test_camera_history_decodes_only_valid_frames(tmp_path, monkeypatch):
+    reader = _masked_camera_reader(tmp_path, return_uint8=False, history=True)
+    key = "observation.images.wrist"
+    reader._meta.episodes[0][f"videos/{key}/from_timestamp"] = 0.0
+    reader.hf_dataset = reader.hf_dataset.with_format(None).remove_columns(f"{key}_padding_mask")
+    reader.hf_dataset = reader.hf_dataset.add_column(f"{key}_padding_mask", [False, True, False])
+    reader.hf_dataset.set_transform(hf_transform_to_torch)
+    wrist_queries = []
+
+    def decode(path, timestamps, tolerance_s, backend, *, return_uint8, is_depth):
+        if str(path).endswith("wrist.mp4"):
+            wrist_queries.extend(timestamps)
+        return torch.ones(len(timestamps), 3, 4, 6)
+
+    monkeypatch.setattr("lerobot.datasets.dataset_reader._decode_local_video", decode)
+    item = reader.get_item(2)
+    assert wrist_queries == pytest.approx([1 / 30])
+    assert item[f"{key}_padding_mask"].tolist() == [False, True, False]
+    assert torch.all(item[key][1] == 1)
+    assert torch.count_nonzero(item[key][[0, 2]]) == 0
+
+
+@pytest.mark.parametrize("camera_masks", [None, {"observation.images.top": torch.tensor(True)}])
+def test_unmasked_video_index_errors_are_not_hidden(tmp_path, monkeypatch, camera_masks):
+    reader = _masked_camera_reader(tmp_path, return_uint8=False)
+    key = "observation.images.top"
+
+    def decode(*args, **kwargs):
+        raise IndexError("Invalid frame index")
+
+    monkeypatch.setattr("lerobot.datasets.dataset_reader._decode_local_video", decode)
+    with pytest.raises(IndexError, match="Invalid frame index"):
+        reader._query_videos({key: [0.0]}, 0, camera_masks)
+
 
 # ── Loading ──────────────────────────────────────────────────────────
 

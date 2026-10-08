@@ -24,12 +24,73 @@ that must not leak into the training path, so that is what these assert.
 import pytest
 import torch
 
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
-from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel, PI05Pytorch
+from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel, PI05Policy, PI05Pytorch
 from tests.utils import require_cuda
 
 TOKENS_PER_IMAGE = 4
 EMBED_DIM = 8
+
+
+class _PreprocessHarness(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.config = PI05Config(
+            image_resolution=(4, 6),
+            input_features={
+                "observation.images.wrist": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 4, 6))
+            },
+        )
+
+    _preprocess_images = PI05Policy._preprocess_images
+
+
+@pytest.mark.parametrize("trailing_dim", [False, True])
+def test_pi05_preprocessing_honors_missing_camera_masks(trailing_dim):
+    key = "observation.images.wrist"
+    mask = torch.tensor([True, False])
+    batch = {key: torch.zeros(2, 3, 4, 6), f"{key}_padding_mask": mask[:, None] if trailing_dim else mask}
+
+    images, masks = _PreprocessHarness()._preprocess_images(batch)
+
+    assert torch.all(images[0] == -1)
+    assert masks[0].tolist() == [True, False]
+
+
+@pytest.mark.parametrize(
+    "mask_shape", ["per_frame", "per_frame_trailing_dim", "per_camera", "per_camera_trailing_dim"]
+)
+def test_pi05_memory_combines_camera_validity_with_history_padding(mask_shape):
+    key = "observation.images.wrist"
+    mask = torch.tensor([[True, True, False], [True, True, True]])
+    if mask_shape == "per_frame_trailing_dim":
+        mask = mask[:, :, None]
+    elif mask_shape.startswith("per_camera"):
+        mask = torch.tensor([False, True])
+        if mask_shape == "per_camera_trailing_dim":
+            mask = mask[:, None]
+    batch = {
+        key: torch.zeros(2, 3, 3, 4, 6),
+        f"{key}_padding_mask": mask,
+        f"{key}_is_pad": torch.tensor([[True, False, False], [True, False, False]]),
+    }
+
+    _, masks = _PreprocessHarness()._preprocess_images(batch)
+
+    expected = (
+        [[False, False, False], [False, True, True]]
+        if mask_shape.startswith("per_camera")
+        else [[False, True, False], [False, True, True]]
+    )
+    assert masks[0].tolist() == expected
+
+
+def test_pi05_preprocessing_without_camera_masks_keeps_existing_behavior():
+    key = "observation.images.wrist"
+    _, masks = _PreprocessHarness()._preprocess_images({key: torch.zeros(2, 3, 4, 6)})
+    assert masks[0].tolist() == [True, True]
 
 
 class _RecordingVisionTower:
