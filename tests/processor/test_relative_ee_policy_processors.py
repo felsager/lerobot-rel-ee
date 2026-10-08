@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -126,6 +127,49 @@ def test_smolvla_relative_ee_processors_save_load_and_reconnect(rot_repr):
     torch.testing.assert_close(
         quat_to_rotmat(decoded[..., 3:7]), quat_to_rotmat(target[..., 3:7]), atol=1e-6, rtol=0
     )
+
+
+@pytest.mark.parametrize("identity_norm", [False, True])
+def test_legacy_relative_ee_checkpoint_loads_without_rotation_fields(tmp_path, identity_norm):
+    config = _relative_ee_smolvla_config(RotationRepresentation.rot6d)
+    config.rot6d_identity_norm = identity_norm
+    config.save_pretrained(tmp_path)
+    preprocessor, postprocessor = make_smolvla_pre_post_processors(
+        config, _model_space_stats(RotationRepresentation.rot6d)
+    )
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    # Reproduce the schema before rotation representations became configurable.
+    for path in tmp_path.glob("*.json"):
+        saved = json.loads(path.read_text())
+        saved.pop("rotation_representation", None)
+        for step in saved.get("steps", []):
+            step.get("config", {}).pop("rot_repr", None)
+        path.write_text(json.dumps(saved))
+
+    loaded_config = SmolVLAConfig.from_pretrained(tmp_path)
+    assert loaded_config.rotation_representation == RotationRepresentation.rot6d
+    loaded_pre, loaded_post = make_pre_post_processors(loaded_config, pretrained_path=tmp_path)
+    relative = _step(loaded_pre, RelativeEEActionsStep)
+    absolute = _step(loaded_post, AbsoluteEEActionsStep)
+    assert absolute.relative_step is relative
+    assert _step(loaded_pre, EEStateStep).rot_repr == RotationRepresentation.rot6d
+
+    state = torch.tensor([[0.2, -0.1, 0.3, 0, 0, 0, 1, 0.5]])
+    target = torch.tensor([[[0.4, 0.1, 0.2, 0, 0, 0.6, 0.8, 0.7]]])
+    encoded = relative(batch_to_transition({OBS_STATE: state, ACTION: target}))[TransitionKey.ACTION]
+    assert encoded.shape[-1] == 10
+    decoded = absolute(batch_to_transition({ACTION: encoded}))[TransitionKey.ACTION]
+    torch.testing.assert_close(decoded[..., :3], target[..., :3], atol=1e-6, rtol=0)
+    torch.testing.assert_close(decoded[..., -1:], target[..., -1:])
+    torch.testing.assert_close(
+        quat_to_rotmat(decoded[..., 3:7]), quat_to_rotmat(target[..., 3:7]), atol=1e-6, rtol=0
+    )
+
+
+def test_smolvla_default_rotation_is_rot6d():
+    assert SmolVLAConfig(device="cpu").rotation_representation == RotationRepresentation.rot6d
 
 
 def _stats_with_identity_rot6d() -> dict[str, torch.Tensor]:

@@ -550,9 +550,8 @@ def test_relative_ee_statistics_match_model_samples(rot_repr):
 
 
 @pytest.mark.parametrize("step_type", [RelativeEEActionsStep, EEStateStep])
-def test_ee_representation_is_required(step_type):
-    with pytest.raises(TypeError):
-        step_type()
+def test_missing_ee_representation_uses_legacy_rot6d(step_type):
+    assert step_type().rot_repr == ROT6D
 
 
 @pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
