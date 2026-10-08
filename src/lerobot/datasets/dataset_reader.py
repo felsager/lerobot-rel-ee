@@ -39,15 +39,15 @@ from .io_utils import (
 )
 from .utils import delta_window, resolve_episode_indices, shift_timestamps, task_name
 from .video_utils import (
+    VideoDecoderCache,
     apply_rgb_transforms,
     convert_image_depth_units,
     decode_video_frames,
+    decode_video_frames_torchcodec,
     depth_encoder_configs,
     dequantize_depth_frames,
     image_depth_units,
 )
-from .utils import resolve_episode_indices
-from .video_utils import VideoDecoderCache, decode_video_frames, decode_video_frames_torchcodec
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,9 @@ def _decode_local_video(
                 or "decoder" not in str(error).lower()
             ):
                 raise
-            raise InvalidLocalVideoError(f"video={video_path}; timestamps={timestamps}; error={error}") from error
+            raise InvalidLocalVideoError(
+                f"video={video_path}; timestamps={timestamps}; error={error}"
+            ) from error
     finally:
         cache.clear()
 
@@ -478,7 +480,12 @@ class DatasetReader(BaseDatasetReader):
             for rel in rel_per_item
         ]
 
-    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
+    def _query_videos(
+        self,
+        query_timestamps: dict[str, list[float]],
+        ep_idx: int,
+        camera_masks: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
         in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
         Segmentation Fault.
@@ -486,7 +493,31 @@ class DatasetReader(BaseDatasetReader):
         ep = self._meta.episodes[ep_idx]
 
         def _decode_single(vid_key: str, query_ts: list[float]) -> tuple[str, torch.Tensor]:
-            shifted_query_ts = shift_timestamps(query_ts, ep[f"videos/{vid_key}/from_timestamp"])
+            valid = None
+            if camera_masks is not None and vid_key in camera_masks:
+                valid = camera_masks[vid_key].bool().reshape(-1)
+                if valid.numel() != len(query_ts):
+                    raise ValueError(f"{vid_key}_padding_mask must have one validity value per queried frame")
+                # Absent cameras may reference a shared placeholder video with unusable offsets.
+                # Keep the camera slot, but never access that video for masked frames.
+                if not valid.any():
+                    feature = self._meta.features[vid_key]
+                    shape = tuple(feature["shape"])
+                    names = feature.get("names") or ["height", "width", "channels"]
+                    if names[-1] in ("channel", "channels"):
+                        shape = (shape[-1], *shape[:-1])
+                    dtype = (
+                        torch.uint8
+                        if self._return_uint8 and vid_key not in self._meta.depth_keys
+                        else torch.float32
+                    )
+                    return vid_key, torch.zeros((len(query_ts), *shape), dtype=dtype).squeeze(0)
+            decode_ts = (
+                query_ts
+                if valid is None
+                else [ts for ts, keep in zip(query_ts, valid.tolist(), strict=True) if keep]
+            )
+            shifted_query_ts = shift_timestamps(decode_ts, ep[f"videos/{vid_key}/from_timestamp"])
             video_path = self.root / self._meta.get_video_file_path(ep_idx, vid_key)
             frames = _decode_local_video(
                 video_path,
@@ -500,6 +531,10 @@ class DatasetReader(BaseDatasetReader):
                 frames = dequantize_depth_frames(
                     frames, self._depth_encoder_configs[vid_key], self._depth_output_unit
                 )
+            if valid is not None and not valid.all():
+                padded_frames = frames.new_zeros((len(query_ts), *frames.shape[1:]))
+                padded_frames[valid] = frames
+                frames = padded_frames
             return vid_key, frames.squeeze(0)
 
         items = list(query_timestamps.items())
@@ -518,8 +553,8 @@ class DatasetReader(BaseDatasetReader):
 
         "Relative" is the row position in the (possibly episode-filtered) ``hf_dataset``,
         not the dataset-wide absolute index (see :attr:`absolute_to_relative_idx`).
-        Delegates to :meth:`get_items` so single- and batched-access share one
-        code path (and identical output).
+        Single- and batched-access share the same assembly path. Undecodable
+        video rows are replaced with complete valid samples.
 
         Args:
             idx: Relative row position in the loaded ``hf_dataset``.
@@ -527,25 +562,8 @@ class DatasetReader(BaseDatasetReader):
         Returns:
             The fully assembled frame dict for ``idx``.
         """
-        return self.get_items([idx])[0]
-
-    def get_items(self, indices: list[int]) -> list[dict]:
-        """Assemble frame dicts for a batch of *relative* indices.
-
-        "Relative" indices are row positions in the (possibly episode-filtered) ``hf_dataset``,
-        not the dataset-wide absolute indices (see :attr:`absolute_to_relative_idx`).
-
-        Tabular rows are gathered from the Arrow-backed HF dataset in one shot,
-        while video frames are decoded one item at a time to avoid competing with the multiple workers of the DataLoader.
-
-        Args:
-            indices: Relative row positions in the loaded ``hf_dataset``.
-
-        Returns:
-            One fully assembled frame dict per entry in ``indices``, in order.
-        """Replace an undecodable row with a complete valid row, keeping batch size stable."""
         try:
-            return self._get_item(idx)
+            return self._get_items([idx])[0]
         except InvalidLocalVideoError as error:
             logger.warning("Replacing invalid local sample: index=%s %s", idx, error)
         hf_dataset = self.hf_dataset
@@ -557,7 +575,7 @@ class DatasetReader(BaseDatasetReader):
         for candidate in candidates:
             candidate += candidate >= idx
             try:
-                return self._get_item(candidate)
+                return self._get_items([candidate])[0]
             except InvalidLocalVideoError as error:
                 logger.warning(
                     "Replacement local sample also invalid: requested=%s candidate=%s %s",
@@ -567,12 +585,22 @@ class DatasetReader(BaseDatasetReader):
                 )
         raise RuntimeError(f"No decodable replacement for index={idx} after {len(candidates)} attempts")
 
-    def _get_item(self, idx: int) -> dict:
-        """Core __getitem__ logic. Loads hf_dataset on first access.
+    def get_items(self, indices: list[int]) -> list[dict]:
+        """Assemble frame dicts for a batch of *relative* indices.
 
-        ``idx`` is a *relative* index into the (possibly episode-filtered)
-        HF dataset, **not** the absolute frame index stored in the ``index``
-        column.  The absolute index is retrieved from the row itself.
+        Tabular rows are gathered in one shot. If video decoding fails, retry
+        the batch per item so only undecodable rows are replaced.
+        """
+        try:
+            return self._get_items(indices)
+        except InvalidLocalVideoError:
+            return [self.get_item(idx) for idx in indices]
+
+    def _get_items(self, indices: list[int]) -> list[dict]:
+        """Gather a batch, propagating undecodable videos to the replacement path.
+
+        Indices are row positions in the loaded, possibly episode-filtered
+        dataset. Delta windows use the absolute indices stored in those rows.
         """
         # One-shot load after finalize()
         hf_dataset = self.hf_dataset if self.hf_dataset is not None else self.load_and_activate()
@@ -592,7 +620,14 @@ class DatasetReader(BaseDatasetReader):
         query_indices_per_item: list[dict[str, list[int]] | None] = [None] * n
         if self.delta_indices is not None:
             for i in range(n):
-                query_indices_per_item[i], padding = self._get_query_indices(abs_idxs[i], ep_idxs[i])
+                query_indices, padding = self._get_query_indices(abs_idxs[i], ep_idxs[i])
+                # Gather each camera's validity mask over the same history as its
+                # images, even when only that camera has observation deltas.
+                for key in self._meta.video_keys:
+                    mask_key = f"{key}_padding_mask"
+                    if mask_key in items[i] and key in query_indices:
+                        query_indices[mask_key] = query_indices[key]
+                query_indices_per_item[i] = query_indices
                 items[i].update(padding)
             for i, tabular in enumerate(self._query_hf_dataset(query_indices_per_item)):
                 items[i].update(tabular)
@@ -603,7 +638,12 @@ class DatasetReader(BaseDatasetReader):
             current_ts = [float(items[i]["timestamp"]) for i in range(n)]
             query_timestamps = self._get_query_timestamps(current_ts, query_indices_per_item)
             for item, query_ts, ep_idx in zip(items, query_timestamps, ep_idxs, strict=True):
-                item.update(self._query_videos(query_ts, ep_idx))
+                camera_masks = {
+                    key: item[f"{key}_padding_mask"]
+                    for key in self._meta.video_keys
+                    if f"{key}_padding_mask" in item
+                }
+                item.update(self._query_videos(query_ts, ep_idx, camera_masks))
 
         for item in items:
             apply_rgb_transforms(item, self._image_transforms, self._meta.camera_keys, self._meta.depth_keys)
