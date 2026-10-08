@@ -98,7 +98,7 @@ def _load_relative_ee_columns(hf_dataset: Dataset | Mapping[str, np.ndarray]) ->
     table = hf_dataset.select_columns(list(dtypes)).with_format("arrow")[:]
     columns = {}
     for key, dtype in dtypes.items():
-        array = table.column(key).combine_chunks()
+        array = table.column(key).combine_chunks()  # type: ignore[reportAttributeAccessIssue]
         if key in (ACTION, OBS_STATE):
             if not (pa.types.is_list(array.type) or pa.types.is_fixed_size_list(array.type)):
                 raise ValueError(f"Relative EE requires {key} to contain 8D vectors")

@@ -31,7 +31,7 @@ class SmolVLAConfig(PreTrainedConfig):
     n_action_steps: int = 50
 
     use_relative_ee: bool = False  # Anchor EE actions to the current state.
-    rotation_representation: RotationRepresentation = RotationRepresentation.quaternion
+    rotation_representation: RotationRepresentation = RotationRepresentation.rot6d
     rot6d_identity_norm: bool = (
         False  # Compute stats that leave action/state rot6d unchanged by normalization.
     )
