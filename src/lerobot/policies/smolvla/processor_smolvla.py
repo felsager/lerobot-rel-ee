@@ -64,10 +64,13 @@ def make_smolvla_pre_post_processors(
     """
 
     steps = make_default_policy_processor_steps(config, dataset_stats)
-    relative_step = RelativeEEActionsStep(
-        state_frame=config.observation_delta_indices.index(0), rot_repr=config.rotation_representation
+    relative_ee_step = RelativeEEActionsStep(
+        enabled=config.use_relative_ee,
+        state_frame=config.observation_delta_indices.index(0),
+        rot_repr=config.rotation_representation,
     )
-    state_step = EEStateStep(rot_repr=config.rotation_representation)
+    absolute_ee_step = AbsoluteEEActionsStep(enabled=config.use_relative_ee, relative_step=relative_ee_step)
+    state_step = EEStateStep(enabled=config.use_relative_ee, rot_repr=config.rotation_representation)
 
     input_steps = [
         steps.rename_observations,  # To mimic the same processor as pretrained one
@@ -80,12 +83,13 @@ def make_smolvla_pre_post_processors(
             max_length=config.tokenizer_max_length,
         ),
         steps.to_device,
-        *([relative_step, state_step] if config.use_relative_ee else []),
+        relative_ee_step,
+        state_step,
         steps.normalize,
     ]
     output_steps = [
         steps.unnormalize,
-        *([AbsoluteEEActionsStep(relative_step=relative_step)] if config.use_relative_ee else []),
+        absolute_ee_step,
         steps.to_cpu,
     ]
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)

@@ -15,6 +15,7 @@
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -23,18 +24,27 @@ pytest.importorskip("transformers")
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature  # noqa: E402
 from lerobot.policies.factory import make_pre_post_processors  # noqa: E402
+from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: E402
+from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors  # noqa: E402
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig  # noqa: E402
 from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors  # noqa: E402
 from lerobot.processor import (  # noqa: E402
+    AbsoluteActionsProcessorStep,
     AbsoluteEEActionsStep,
     EEStateStep,
     NormalizerProcessorStep,
+    RelativeActionsProcessorStep,
     RelativeEEActionsStep,
+    TokenizerProcessorStep,
     TransitionKey,
     batch_to_transition,
     tokenizer_processor,
 )
-from lerobot.processor.relative_ee_action_processor import quat_to_rotmat  # noqa: E402
+from lerobot.processor.relative_ee_action_processor import (  # noqa: E402
+    ee_to_rot_repr,
+    quat_to_rotmat,
+    to_relative_ee_actions,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
 from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation  # noqa: E402
 
@@ -65,6 +75,14 @@ def _step(pipeline, step_type):
 
 
 class _FakeTokenizer:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def __call__(self, text: list[str], max_length: int, **_kwargs: Any) -> dict[str, torch.Tensor]:
+        self.prompts = list(text)
+        shape = (len(text), max_length)
+        return {"input_ids": torch.zeros(shape, dtype=torch.long), "attention_mask": torch.ones(shape)}
+
     def save_pretrained(self, save_directory: Path) -> None:
         save_directory.mkdir(parents=True, exist_ok=True)
         (save_directory / "tokenizer_config.json").write_text("{}")
@@ -228,3 +246,119 @@ def test_smolvla_identity_rotation_normalization_requires_rot6d(rot_repr):
     else:
         with pytest.raises(ValueError, match="rot6d_identity_norm"):
             SmolVLAConfig(use_relative_ee=True, rotation_representation=rot_repr, rot6d_identity_norm=True)
+
+
+def _pi05_config(rot_repr: RotationRepresentation, *, mode: str = "ee", memory: bool = False) -> PI05Config:
+    config = PI05Config(
+        use_relative_ee=mode == "ee",
+        use_relative_actions=mode == "joint",
+        use_proprioceptive_memory=memory,
+        memory_frames=3,
+        device="cpu",
+        rotation_representation=rot_repr,
+    )
+    dim = 4 + ROT_REPR_DIM[rot_repr] if mode == "ee" else 8
+    config.input_features = {OBS_STATE: PolicyFeature(FeatureType.STATE, (dim,))}
+    config.output_features = {ACTION: PolicyFeature(FeatureType.ACTION, (dim,))}
+    return config
+
+
+def _pi05_quantile_stats(dim: int) -> dict[str, dict[str, torch.Tensor]]:
+    return {
+        OBS_STATE: {"q01": -2 * torch.ones(dim), "q99": 2 * torch.ones(dim)},
+        ACTION: {"q01": -4 * torch.ones(dim), "q99": 4 * torch.ones(dim)},
+    }
+
+
+def _pi05_ee_batch(memory: bool) -> dict[str, Any]:
+    state = torch.tensor([[0.25, 0.5, -0.25, 0, 0, 0.6, 0.8, 0.5]])
+    if memory:
+        state = state[:, None].expand(-1, 3, -1).clone()
+        state[:, :-1, :3] += 2  # A first-frame anchor would produce different actions.
+    return {
+        OBS_STATE: state,
+        ACTION: torch.tensor([[[0.4, 0.1, 0.2, 0, 0.6, 0, 0.8, 0.7], [0.3, 0.2, 0.1, 0, 0, 0, 1, 0.2]]]),
+        "task": ["pick_up"],
+    }
+
+
+@pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
+@pytest.mark.parametrize("memory", [False, True])
+@pytest.mark.parametrize("reload", [False, True], ids=["fresh", "reloaded"])
+def test_pi05_relative_ee_pipeline_roundtrip(
+    tmp_path: Path, rot_repr: RotationRepresentation, memory: bool, reload: bool
+) -> None:
+    config = _pi05_config(rot_repr, memory=memory)
+    dim = config.output_features[ACTION].shape[0]
+    pre, post = make_pi05_pre_post_processors(config, _pi05_quantile_stats(dim))
+    if reload:
+        config.save_pretrained(tmp_path)
+        pre.save_pretrained(tmp_path)
+        post.save_pretrained(tmp_path)
+        config = PI05Config.from_pretrained(tmp_path)
+        pre, post = make_pre_post_processors(config, pretrained_path=tmp_path)
+
+    generic_relative = next(s for s in pre.steps if type(s) is RelativeActionsProcessorStep)
+    generic_absolute = next(s for s in post.steps if type(s) is AbsoluteActionsProcessorStep)
+    ee_relative = _step(pre, RelativeEEActionsStep)
+    ee_absolute = _step(post, AbsoluteEEActionsStep)
+    assert not generic_relative.enabled and not generic_absolute.enabled
+    assert generic_absolute.relative_step is generic_relative
+    assert ee_absolute.relative_step is ee_relative
+    assert ee_relative.enabled and ee_absolute.enabled and _step(pre, EEStateStep).enabled
+    assert ee_relative.rot_repr == rot_repr
+    assert config.max_state_dim == config.max_action_dim == 32
+
+    batch = _pi05_ee_batch(memory)
+    state, target = batch[OBS_STATE], batch[ACTION]
+    current_state = state[:, -1] if memory else state
+    processed = pre(batch)
+    torch.testing.assert_close(processed[OBS_STATE], ee_to_rot_repr(state, rot_repr) / 2)
+    torch.testing.assert_close(processed[ACTION], to_relative_ee_actions(target, current_state, rot_repr) / 4)
+    assert processed[ACTION].shape == (1, 2, dim)
+    assert processed[OBS_STATE].shape == ((1, 3, dim) if memory else (1, dim))
+
+    # Inspect the actual text sent to the tokenizer, without downloading PaliGemma.
+    prompt = _step(pre, TokenizerProcessorStep).input_tokenizer.prompts[0]
+    if memory:
+        assert prompt == "Task: pick up;\nAction: "
+    else:
+        state_tokens = prompt.split("State: ")[1].split(";\nAction: ")[0].split()
+        assert prompt.startswith("Task: pick up, State: ")
+        assert len(state_tokens) == dim
+        # Raw xyz [0.25, 0.5, -0.25] must first normalize to [0.125, 0.25, -0.125].
+        assert state_tokens[:3] == ["144", "160", "112"]
+        assert state_tokens[-1] == "160"  # normalized gripper 0.25
+
+    decoded = post(processed[ACTION])
+    torch.testing.assert_close(decoded[..., :3], target[..., :3], atol=1e-6, rtol=0)
+    torch.testing.assert_close(decoded[..., -1:], target[..., -1:], atol=1e-6, rtol=0)
+    torch.testing.assert_close(
+        quat_to_rotmat(decoded[..., 3:7]), quat_to_rotmat(target[..., 3:7]), atol=1e-6, rtol=0
+    )
+
+
+@pytest.mark.parametrize("mode", ["joint", "absolute"])
+def test_pi05_non_ee_modes_survive_pipeline_reload(tmp_path: Path, mode: str) -> None:
+    config = _pi05_config(RotationRepresentation.rot6d, mode=mode)
+    pre, post = make_pi05_pre_post_processors(config, _pi05_quantile_stats(8))
+    pre.save_pretrained(tmp_path)
+    post.save_pretrained(tmp_path)
+    pre, post = make_pre_post_processors(config, pretrained_path=tmp_path)
+
+    generic_relative = next(s for s in pre.steps if type(s) is RelativeActionsProcessorStep)
+    generic_absolute = next(s for s in post.steps if type(s) is AbsoluteActionsProcessorStep)
+    assert generic_absolute.relative_step is generic_relative
+    assert generic_relative.enabled == generic_absolute.enabled == (mode == "joint")
+    assert _step(post, AbsoluteEEActionsStep).relative_step is _step(pre, RelativeEEActionsStep)
+    assert not _step(pre, RelativeEEActionsStep).enabled
+    assert not _step(pre, EEStateStep).enabled
+    assert not _step(post, AbsoluteEEActionsStep).enabled
+
+    batch = _pi05_ee_batch(memory=False)
+    state, target = batch[OBS_STATE], batch[ACTION]
+    processed = pre(batch)
+    expected_actions = target - state[:, None] if mode == "joint" else target
+    torch.testing.assert_close(processed[ACTION], expected_actions / 4)
+    torch.testing.assert_close(processed[OBS_STATE], state / 2)
+    torch.testing.assert_close(post(processed[ACTION]), target, atol=1e-6, rtol=0)

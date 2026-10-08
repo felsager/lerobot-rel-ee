@@ -97,7 +97,13 @@ def _prepare_continuation(
         state = relative_ee_step.get_cached_state()
         if state is None:
             raise ValueError("Relative EE RTC preprocessor did not cache the current raw state.")
-        reanchored = reanchor_relative_ee_rtc_prefix(canonical, state, normalizer_step, device)
+        reanchored = reanchor_relative_ee_rtc_prefix(
+            canonical,
+            state,
+            normalizer_step,
+            device,
+            rot_repr=relative_ee_step.rot_repr,
+        )
         if reanchored.shape != model.shape:
             raise ValueError("Re-anchored EE continuation must match the model action shape.")
         model = reanchored

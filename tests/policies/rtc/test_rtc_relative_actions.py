@@ -14,6 +14,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 from lerobot.configs.types import (
@@ -31,6 +32,7 @@ from lerobot.processor.relative_action_processor import (
 )
 from lerobot.processor.relative_ee_action_processor import to_absolute_ee_actions, to_relative_ee_actions
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation
 
 
 def _import_rtc_module(module_name: str, filename: str):
@@ -734,7 +736,8 @@ class TestMultiChunkConsistency:
 class TestRelativeEEReanchoring:
     """RTC re-anchoring for relative EE actions: absolute leftovers re-expressed in SE(3)."""
 
-    def test_prefix_is_reanchored_from_absolute_leftovers(self):
+    @pytest.mark.parametrize("rot_repr", [r for r in RotationRepresentation if ROT_REPR_DIM[r] is not None])
+    def test_prefix_is_reanchored_from_absolute_leftovers(self, rot_repr: RotationRepresentation):
         """The re-anchored prefix equals the relative EE encoding against the current state."""
         current_state = torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, _S, _S, 0.5]])
         absolute_actions = torch.tensor(
@@ -749,11 +752,19 @@ class TestRelativeEEReanchoring:
             current_state=current_state,
             normalizer_step=None,
             policy_device="cpu",
+            rot_repr=rot_repr,
         )
 
-        torch.testing.assert_close(actual, to_relative_ee_actions(absolute_actions, current_state[0]))
+        assert actual.shape == (2, 4 + ROT_REPR_DIM[rot_repr])
+        torch.testing.assert_close(
+            actual, to_relative_ee_actions(absolute_actions, current_state[0], rot_repr)
+        )
 
-    def test_reanchored_prefix_decodes_back_to_the_same_absolute_poses(self):
+    @pytest.mark.parametrize("rot_repr", [r for r in RotationRepresentation if ROT_REPR_DIM[r] is not None])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_reanchored_prefix_decodes_back_to_the_same_absolute_poses(
+        self, rot_repr: RotationRepresentation, batched: bool
+    ):
         """Re-expressed against the new reference, the leftovers still describe the same absolute targets.
 
         Elementwise re-anchoring fails this as soon as the reference is rotated.
@@ -765,17 +776,21 @@ class TestRelativeEEReanchoring:
                 [0.6, 0.0, 0.25, 0.0, _S, 0.0, _S, 0.8],
             ]
         )
+        if batched:
+            absolute_actions = absolute_actions.unsqueeze(0).expand(2, -1, -1).clone()
+            new_state = new_state.expand(2, -1).clone()
 
         relative = reanchor_relative_ee_rtc_prefix(
             prev_actions_absolute=absolute_actions,
             current_state=new_state,
             normalizer_step=None,
             policy_device="cpu",
+            rot_repr=rot_repr,
         )
-        decoded = to_absolute_ee_actions(relative, new_state[0])
+        decoded = to_absolute_ee_actions(relative, new_state if batched else new_state[0], rot_repr)
 
-        torch.testing.assert_close(decoded[:, :3], absolute_actions[:, :3], atol=1e-5, rtol=0)
-        torch.testing.assert_close(decoded[:, 7:], absolute_actions[:, 7:], atol=1e-6, rtol=0)
+        torch.testing.assert_close(decoded[..., :3], absolute_actions[..., :3], atol=1e-5, rtol=0)
+        torch.testing.assert_close(decoded[..., 7:], absolute_actions[..., 7:], atol=1e-6, rtol=0)
         # q and -q are the same rotation, so compare up to sign.
-        dots = (decoded[:, 3:7] * absolute_actions[:, 3:7]).sum(dim=-1).abs()
-        torch.testing.assert_close(dots, torch.ones(2), atol=1e-5, rtol=0)
+        dots = (decoded[..., 3:7] * absolute_actions[..., 3:7]).sum(dim=-1).abs()
+        torch.testing.assert_close(dots, torch.ones_like(dots), atol=1e-5, rtol=0)
