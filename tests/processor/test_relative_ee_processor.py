@@ -191,8 +191,8 @@ def test_relative_ee_training_transition_through_steps(rot_repr):
     actions[:, 0] = state[:, 0]  # first target equals the reference
 
     transition = batch_to_transition({OBS_STATE: state, ACTION: actions})
-    transition = RelativeEEActionsStep(state_frame=0, rot_repr=rot_repr)(transition)
-    transition = EEStateStep(rot_repr=rot_repr)(transition)
+    transition = RelativeEEActionsStep(enabled=True, state_frame=0, rot_repr=rot_repr)(transition)
+    transition = EEStateStep(enabled=True, rot_repr=rot_repr)(transition)
 
     relative = transition[TransitionKey.ACTION]
     assert relative.shape == (2, 50, 4 + ROT_REPR_DIM[rot_repr])
@@ -207,7 +207,7 @@ def test_relative_ee_state_frame_selects_the_current_frame():
     # Diffusion-style observation frames [-1, 0]: the current frame is index 1.
     torch.manual_seed(7)
     state, actions = _random_ee(2, 2), _random_ee(2, 10)
-    transition = RelativeEEActionsStep(state_frame=1, rot_repr=ROT6D)(
+    transition = RelativeEEActionsStep(enabled=True, state_frame=1, rot_repr=ROT6D)(
         batch_to_transition({OBS_STATE: state, ACTION: actions})
     )
     torch.testing.assert_close(
@@ -221,14 +221,14 @@ def test_relative_ee_state_frame_selects_the_current_frame():
 def test_relative_ee_stacked_state_without_state_frame_raises():
     transition = batch_to_transition({OBS_STATE: _random_ee(2, 1), ACTION: _random_ee(2, 10)})
     with pytest.raises(ValueError, match="state_frame is unset"):
-        RelativeEEActionsStep(rot_repr=ROT6D)(transition)
+        RelativeEEActionsStep(enabled=True, rot_repr=ROT6D)(transition)
 
 
 @pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
 def test_ee_state_step_matches_ee_to_rot_repr(rot_repr):
     # The stats are computed with ee_to_rot_repr, so the step must produce exactly the same values.
     state = _random_ee(3)
-    stepped = EEStateStep(rot_repr=rot_repr)(batch_to_transition({OBS_STATE: state}))[
+    stepped = EEStateStep(enabled=True, rot_repr=rot_repr)(batch_to_transition({OBS_STATE: state}))[
         TransitionKey.OBSERVATION
     ][OBS_STATE]
     torch.testing.assert_close(stepped, ee_to_rot_repr(state, rot_repr=rot_repr), atol=0, rtol=0)
@@ -237,8 +237,8 @@ def test_ee_state_step_matches_ee_to_rot_repr(rot_repr):
 @pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
 def test_absolute_ee_step_decodes_against_cached_reference(rot_repr):
     torch.manual_seed(8)
-    relative_step = RelativeEEActionsStep(rot_repr=rot_repr)
-    absolute_step = AbsoluteEEActionsStep(relative_step=relative_step)
+    relative_step = RelativeEEActionsStep(enabled=True, rot_repr=rot_repr)
+    absolute_step = AbsoluteEEActionsStep(enabled=True, relative_step=relative_step)
     state = _random_ee(1)
     relative_action = to_relative_ee_actions(_random_ee(1), state, rot_repr=rot_repr)
 
@@ -251,7 +251,7 @@ def test_absolute_ee_step_decodes_against_cached_reference(rot_repr):
 
 
 def test_relative_ee_reference_is_held_while_chunk_is_in_flight():
-    relative_step = RelativeEEActionsStep(rot_repr=ROT6D)
+    relative_step = RelativeEEActionsStep(enabled=True, rot_repr=ROT6D)
     queue = {"size": 0}
     policy = SimpleNamespace(count_queued_actions=lambda: queue["size"])
     assert bind_relative_anchor(policy, SimpleNamespace(steps=[relative_step])) is relative_step
@@ -267,12 +267,13 @@ def test_relative_ee_reference_is_held_while_chunk_is_in_flight():
 
 
 @pytest.mark.parametrize("rot_repr", SUPPORTED_REPRESENTATIONS)
-def test_relative_ee_steps_get_config_roundtrip(rot_repr):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_relative_ee_steps_get_config_roundtrip(rot_repr, enabled):
     # Loading a saved pipeline rebuilds each step from its get_config().
     for step in (
-        RelativeEEActionsStep(state_frame=0, rot_repr=rot_repr),
-        EEStateStep(rot_repr=rot_repr),
-        AbsoluteEEActionsStep(),
+        RelativeEEActionsStep(enabled=enabled, state_frame=0, rot_repr=rot_repr),
+        EEStateStep(enabled=enabled, rot_repr=rot_repr),
+        AbsoluteEEActionsStep(enabled=enabled),
     ):
         rebuilt = type(step)(**step.get_config())
         assert rebuilt.get_config() == step.get_config()
@@ -290,19 +291,26 @@ def test_relative_ee_steps_transform_features(rot_repr):
         PipelineFeatureType.OBSERVATION: {OBS_STATE: PolicyFeature(FeatureType.STATE, (8,))},
         PipelineFeatureType.ACTION: {ACTION: PolicyFeature(FeatureType.ACTION, (8,))},
     }
-    model_side = EEStateStep(rot_repr=rot_repr).transform_features(
-        RelativeEEActionsStep(rot_repr=rot_repr).transform_features(features)
+    model_side = EEStateStep(enabled=True, rot_repr=rot_repr).transform_features(
+        RelativeEEActionsStep(enabled=True, rot_repr=rot_repr).transform_features(features)
     )
     assert model_side[PipelineFeatureType.OBSERVATION][OBS_STATE].shape == (4 + ROT_REPR_DIM[rot_repr],)
     assert model_side[PipelineFeatureType.ACTION][ACTION].shape == (4 + ROT_REPR_DIM[rot_repr],)
 
-    robot_side = AbsoluteEEActionsStep().transform_features(model_side)
+    robot_side = AbsoluteEEActionsStep(enabled=True).transform_features(model_side)
     assert robot_side[PipelineFeatureType.ACTION][ACTION].shape == (8,)
 
     # Disabled steps leave the declared shapes alone, and the input is never mutated.
     assert RelativeEEActionsStep(enabled=False, rot_repr=rot_repr).transform_features(features) == features
     assert EEStateStep(enabled=False, rot_repr=rot_repr).transform_features(features) == features
     assert features[PipelineFeatureType.ACTION][ACTION].shape == (8,)
+
+
+def test_relative_ee_steps_are_disabled_by_default():
+    transition = batch_to_transition({OBS_STATE: _random_ee(2, 1), ACTION: _random_ee(2, 10)})
+    for step in (RelativeEEActionsStep(), EEStateStep(), AbsoluteEEActionsStep()):
+        assert not step.enabled
+        assert step(transition) is transition
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from lerobot.processor import (
     to_relative_actions,
     to_relative_ee_actions,
 )
+from lerobot.utils.rotation_representations import RotationRepresentation
 
 
 def reanchor_relative_rtc_prefix(
@@ -67,8 +68,9 @@ def reanchor_relative_ee_rtc_prefix(
     current_state: torch.Tensor,
     normalizer_step: NormalizerProcessorStep | None,
     policy_device: torch.device | str,
+    rot_repr: RotationRepresentation,
 ) -> torch.Tensor:
-    """Re-express absolute EE leftovers in the current chunk reference frame."""
+    """Encode 8D absolute EE leftovers in the current frame using the model's rotation representation."""
     actions = prev_actions_absolute.detach().cpu()
     state = current_state.detach().cpu()
     if actions.ndim not in (2, 3) or actions.shape[-1] != 8:
@@ -82,7 +84,7 @@ def reanchor_relative_ee_rtc_prefix(
             )
         state = state[0]
 
-    transition = create_transition(action=to_relative_ee_actions(actions, state))
+    transition = create_transition(action=to_relative_ee_actions(actions, state, rot_repr))
     if normalizer_step is not None:
         transition = normalizer_step(transition)
     return transition[TransitionKey.ACTION].to(policy_device)

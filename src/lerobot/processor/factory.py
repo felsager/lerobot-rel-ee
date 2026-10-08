@@ -44,6 +44,7 @@ from .pipeline import (
     RobotProcessorPipeline,
 )
 from .relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
+from .relative_ee_action_processor import AbsoluteEEActionsStep, RelativeEEActionsStep
 from .rename_processor import RenameObservationsProcessorStep
 
 
@@ -194,12 +195,26 @@ def _reconnect_relative_absolute_steps(
     the RelativeActionsProcessorStep so it can read the cached state at inference time.
     That reference is not serializable, so we re-establish it here after loading.
     """
-    relative_step = next((s for s in preprocessor.steps if isinstance(s, RelativeActionsProcessorStep)), None)
-    if relative_step is None:
-        return
+    relative_step = next(
+        (
+            s
+            for s in preprocessor.steps
+            if isinstance(s, RelativeActionsProcessorStep) and not isinstance(s, RelativeEEActionsStep)
+        ),
+        None,
+    )
+    relative_ee_step = next((s for s in preprocessor.steps if isinstance(s, RelativeEEActionsStep)), None)
+
     for step in postprocessor.steps:
-        if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
+        if (
+            isinstance(step, AbsoluteActionsProcessorStep)
+            and not isinstance(step, AbsoluteEEActionsStep)
+            and step.relative_step is None
+        ):
             step.relative_step = relative_step
+
+        if isinstance(step, AbsoluteEEActionsStep) and step.relative_step is None:
+            step.relative_step = relative_ee_step
 
 
 def load_pretrained_policy_processors(

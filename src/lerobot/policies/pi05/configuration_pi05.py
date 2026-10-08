@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.rotation_representations import RotationRepresentation
 
 from ..rtc.configuration_rtc import RTCConfig
 
@@ -35,6 +36,12 @@ class PI05Config(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
+
+    use_relative_ee: bool = False  # Anchor EE actions to the current state.
+    rotation_representation: RotationRepresentation = RotationRepresentation.rot6d
+    rot6d_identity_norm: bool = (
+        False  # Compute stats that leave action/state rot6d unchanged by normalization.
+    )
 
     # MEM short-horizon observation memory (https://arxiv.org/abs/2603.03596).
     # Historical image tokens are fused inside SigLIP and dropped before the
@@ -123,6 +130,18 @@ class PI05Config(PreTrainedConfig):
         super().__post_init__()
 
         # Validate configuration
+        if self.use_relative_ee:
+            if self.use_relative_actions:
+                raise ValueError("Relative EE mode cannot be used with 'use_relative_actions")
+            if self.n_obs_steps != 1:
+                raise ValueError("Relative EE mode requires n_obs_steps=1")
+            if self.max_state_dim < 10 or self.max_action_dim < 10:
+                raise ValueError("Relative EE mode requires max_state_dim>=10 and max_action_dim>=10")
+        if self.rot6d_identity_norm and self.rotation_representation != RotationRepresentation.rot6d:
+            raise ValueError(
+                f"Using rot6d_identity_norm requires the rotation representation to be {RotationRepresentation.rot6d}"
+            )
+
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot be greater than chunk_size ({self.chunk_size})"

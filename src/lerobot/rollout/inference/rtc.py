@@ -539,6 +539,7 @@ class RTCInferenceEngine(InferenceEngine):
                                     current_state=raw_state,
                                     normalizer_step=self._normalizer_step,
                                     policy_device=policy_device,
+                                    rot_repr=self._relative_ee_step.rot_repr,
                                 )
                             elif self._relative_step is not None:
                                 raw_state = self._relative_step.get_cached_state()

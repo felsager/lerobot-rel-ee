@@ -25,11 +25,14 @@ from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    AbsoluteEEActionsStep,
+    EEStateStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
     ProcessorStepRegistry,
     RelativeActionsProcessorStep,
+    RelativeEEActionsStep,
     TokenizerProcessorStep,
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
@@ -93,6 +96,13 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return transition
 
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "max_state_dim": self.max_state_dim,
+            "task_key": self.task_key,
+            "include_state_in_prompt": self.include_state_in_prompt,
+        }
+
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
@@ -139,14 +149,26 @@ def make_pi05_pre_post_processors(
         exclude_joints=getattr(config, "relative_exclude_joints", []),
         action_names=getattr(config, "action_feature_names", None),
     )
+    absolute_step = AbsoluteActionsProcessorStep(
+        enabled=config.use_relative_actions, relative_step=relative_step
+    )
 
     steps = make_default_policy_processor_steps(config, dataset_stats)
+    relative_ee_step = RelativeEEActionsStep(
+        enabled=config.use_relative_ee,
+        state_frame=-1,
+        rot_repr=config.rotation_representation,
+    )
+    absolute_ee_step = AbsoluteEEActionsStep(enabled=config.use_relative_ee, relative_step=relative_ee_step)
+    state_step = EEStateStep(enabled=config.use_relative_ee, rot_repr=config.rotation_representation)
 
     # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
     input_steps: list[ProcessorStep] = [
         steps.rename_observations,  # To mimic the same processor as pretrained one
         steps.add_batch_dim,
         relative_step,
+        relative_ee_step,
+        state_step,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         steps.normalize,
@@ -165,7 +187,8 @@ def make_pi05_pre_post_processors(
 
     output_steps: list[ProcessorStep] = [
         steps.unnormalize,
-        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
+        absolute_step,
+        absolute_ee_step,
         steps.to_cpu,
     ]
 

@@ -21,6 +21,7 @@ import torch
 import lerobot.policies.factory as policy_factory
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation
 
 
 def test_make_policy_keeps_peft_adapter_and_base_revisions_separate(monkeypatch):
@@ -147,7 +148,10 @@ def test_make_policy_reads_action_names(monkeypatch, action_key, raw_names, expe
     ],
     ids=["fresh_config", "pretrained_config"],
 )
-def test_make_policy_uses_model_facing_relative_ee_shapes(monkeypatch, existing_input_features):
+@pytest.mark.parametrize("rot_repr", RotationRepresentation)
+def test_make_policy_uses_model_facing_relative_ee_shapes(
+    monkeypatch, existing_input_features, rot_repr: RotationRepresentation
+):
     cfg = SimpleNamespace(
         type="mock",
         device="cpu",
@@ -155,6 +159,7 @@ def test_make_policy_uses_model_facing_relative_ee_shapes(monkeypatch, existing_
         pretrained_revision=None,
         use_peft=False,
         use_relative_ee=True,
+        rotation_representation=rot_repr,
         input_features=dict(existing_input_features),
         output_features={},
     )
@@ -168,7 +173,14 @@ def test_make_policy_uses_model_facing_relative_ee_shapes(monkeypatch, existing_
     monkeypatch.setattr(policy_factory, "dataset_to_policy_features", lambda _: raw_features)
     monkeypatch.setattr(policy_factory, "validate_visual_features_consistency", lambda *args: None)
 
+    rotation_dim = ROT_REPR_DIM[rot_repr]
+    if rotation_dim is None:
+        with pytest.raises(ValueError, match="does not support rotation representation"):
+            policy_factory.make_policy(cfg, ds_meta=dataset_meta)
+        policy_class.assert_not_called()
+        return
+
     policy_factory.make_policy(cfg, ds_meta=dataset_meta)
 
-    assert cfg.input_features[OBS_STATE].shape == (10,)
-    assert cfg.output_features[ACTION].shape == (10,)
+    assert cfg.input_features[OBS_STATE].shape == (4 + rotation_dim,)
+    assert cfg.output_features[ACTION].shape == (4 + rotation_dim,)

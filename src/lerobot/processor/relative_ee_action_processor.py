@@ -173,7 +173,7 @@ class RelativeEEActionsStep(RelativeActionsProcessorStep):
     """Convert absolute 8D EE action chunks to (4+m)D, relative to the EE frame of the 8D reference state."""
 
     rot_repr: RotationRepresentation = field(default=RotationRepresentation.rot6d, kw_only=True)
-    enabled: bool = True
+    enabled: bool = False
     state_frame: int | None = None
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -225,7 +225,7 @@ class RelativeEEActionsStep(RelativeActionsProcessorStep):
 class AbsoluteEEActionsStep(AbsoluteActionsProcessorStep):
     """Convert (4+m)D EE action chunks, relative to the EE frame of the 8D reference state, back to absolute 8D."""
 
-    enabled: bool = True
+    enabled: bool = False
     relative_step: RelativeEEActionsStep | None = field(default=None, repr=False)
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
@@ -265,7 +265,7 @@ class EEStateStep(ProcessorStep):
     """Convert the absolute 8D EE state (7D pose + 1D gripper) to absolute (4+m)D ((3+m)D pose + 1D gripper) for the vlm input."""
 
     rot_repr: RotationRepresentation = RotationRepresentation.rot6d
-    enabled: bool = True
+    enabled: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if not self.enabled:

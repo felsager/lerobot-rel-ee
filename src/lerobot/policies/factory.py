@@ -43,6 +43,7 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.import_utils import _peft_available, require_package
+from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation
 
 from .pretrained import PreTrainedPolicy
 from .utils import validate_visual_features_consistency
@@ -295,8 +296,13 @@ def make_policy(
     if getattr(cfg, "use_relative_ee", False):
         if ACTION not in features or features[ACTION].shape != (8,):
             raise ValueError("Relative EE requires raw action features with shape (8,).")
-        features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(10,))
-        features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(10,))
+        rot_repr = getattr(cfg, "rotation_representation", RotationRepresentation.rot6d)
+        rotation_dim = ROT_REPR_DIM[rot_repr]
+        if rotation_dim is None:
+            raise ValueError(f"Relative EE does not support rotation representation {rot_repr!r}.")
+        ee_dim = 4 + rotation_dim
+        features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(ee_dim,))
+        features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(ee_dim,))
 
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
