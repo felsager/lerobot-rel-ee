@@ -828,6 +828,7 @@ class _CameraEncoderThread(threading.Thread):
         self.result_queue = result_queue
         self.stop_event = stop_event
         self.encoder_threads = encoder_threads
+        self.num_frames_encoded: int | None = None
 
     def run(self) -> None:
         from .compute_stats import RunningQuantileStats, auto_downsample_height_width
@@ -912,6 +913,7 @@ class _CameraEncoderThread(threading.Thread):
 
             if container is not None:
                 container.close()
+            self.num_frames_encoded = frame_count
 
             av.logging.restore_default_callback()
 
@@ -959,7 +961,7 @@ class StreamingVideoEncoder:
                 including the depth quantization parameters. When ``None``,
                 :func:`depth_encoder_defaults` is used.
             queue_maxsize: Max frames to buffer per camera before
-                back-pressure drops frames.
+                :meth:`feed_frame` waits for the encoder to catch up.
             encoder_threads: Number of encoder threads (global setting).
                 ``None`` lets the codec decide.
         """
@@ -974,7 +976,8 @@ class StreamingVideoEncoder:
         self._threads: dict[str, _CameraEncoderThread] = {}
         self._stop_events: dict[str, threading.Event] = {}
         self._video_paths: dict[str, Path] = {}
-        self._dropped_frames: dict[str, int] = {}
+        self._frames_fed: dict[str, int] = {}
+        self._waited_keys: set[str] = set()  # cameras already warned about a full queue
         self._episode_active = False
         self._closed = False
 
@@ -992,7 +995,7 @@ class StreamingVideoEncoder:
         if self._episode_active:
             self.cancel_episode()
 
-        self._dropped_frames.clear()
+        self._frames_fed = dict.fromkeys(video_keys, 0)
 
         if depth_video_keys is None:
             depth_video_keys = []
@@ -1030,8 +1033,8 @@ class StreamingVideoEncoder:
 
         A copy of the image is made before enqueueing to prevent race conditions
         with camera drivers that may reuse buffers. If the encoder queue is full
-        (encoder can't keep up), the frame is dropped with a warning instead of
-        crashing the recording session.
+        (encoder can't keep up), this waits until there is room: a dropped frame
+        would shift every later image of the episode against its data rows.
 
         Args:
             video_key: The video feature key
@@ -1043,28 +1046,31 @@ class StreamingVideoEncoder:
         if not self._episode_active:
             raise RuntimeError("No active episode. Call start_episode() first.")
 
-        thread = self._threads[video_key]
-        if not thread.is_alive():
-            # Check for error
+        frame = image.copy()
+        while True:
+            self._raise_if_encoder_dead(video_key)
             try:
-                status, msg = self._result_queues[video_key].get_nowait()
-                if status == "error":
-                    raise RuntimeError(f"Encoder thread for {video_key} crashed: {msg}")
-            except queue.Empty:
-                pass
-            raise RuntimeError(f"Encoder thread for {video_key} is not alive")
+                self._frame_queues[video_key].put(frame, timeout=1)
+                break
+            except queue.Full:
+                if video_key not in self._waited_keys:
+                    logger.warning(
+                        f"Encoder queue full for {video_key}; waiting for the encoder. "
+                        f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
+                    )
+                    self._waited_keys.add(video_key)
+        self._frames_fed[video_key] += 1
 
+    def _raise_if_encoder_dead(self, video_key: str) -> None:
+        if self._threads[video_key].is_alive():
+            return
         try:
-            self._frame_queues[video_key].put(image.copy(), timeout=0.1)
-        except queue.Full:
-            self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
-            count = self._dropped_frames[video_key]
-            # Log periodically to avoid spam (1st, then every 10th)
-            if count == 1 or count % 10 == 0:
-                logger.warning(
-                    f"Encoder queue full for {video_key}, dropped {count} frame(s). "
-                    f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
-                )
+            status, msg = self._result_queues[video_key].get_nowait()
+            if status == "error":
+                raise RuntimeError(f"Encoder thread for {video_key} crashed: {msg}")
+        except queue.Empty:
+            pass
+        raise RuntimeError(f"Encoder thread for {video_key} is not alive")
 
     def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
         """Finish encoding the current episode.
@@ -1079,11 +1085,6 @@ class StreamingVideoEncoder:
             raise RuntimeError("No active episode to finish.")
 
         results: dict[str, tuple[Path, dict | None]] = {}
-
-        # Report dropped frames
-        for video_key, count in self._dropped_frames.items():
-            if count > 0:
-                logger.warning(f"Episode finished with {count} dropped frame(s) for {video_key}.")
 
         # Send sentinel to all queues
         for video_key in self._frame_queues:
@@ -1107,6 +1108,13 @@ class StreamingVideoEncoder:
             except queue.Empty:
                 logger.error(f"No result from encoder thread for {video_key}")
                 results[video_key] = (self._video_paths[video_key], None)
+
+        for video_key, thread in self._threads.items():
+            if thread.num_frames_encoded != self._frames_fed[video_key]:
+                raise RuntimeError(
+                    f"Encoder for {video_key} wrote {thread.num_frames_encoded} of "
+                    f"{self._frames_fed[video_key]} frames"
+                )
 
         self._cleanup()
         self._episode_active = False

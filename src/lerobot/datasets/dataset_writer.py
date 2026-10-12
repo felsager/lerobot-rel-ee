@@ -323,10 +323,12 @@ class DatasetWriter:
         else:
             ep_stats = compute_episode_stats(episode_buffer, self._meta.features)
 
+        # Finish encoding before writing data, so an incomplete video leaves no partial episode behind.
+        streaming_results = streaming_encoder.finish_episode() if streaming_encoder is not None else None
+
         ep_metadata = self._save_episode_data(episode_buffer)
 
-        if streaming_encoder is not None:
-            streaming_results = streaming_encoder.finish_episode()
+        if streaming_results is not None:
             for video_key in self._meta.video_keys:
                 normalization_factor = 255.0 if video_key not in self._meta.depth_keys else 1.0
                 temp_path, video_stats = streaming_results[video_key]
