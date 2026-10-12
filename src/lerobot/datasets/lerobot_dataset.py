@@ -206,7 +206,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_encoding (bool, optional): If True, encode video frames in real-time during capture
                 instead of writing PNG images first. This makes save_episode() near-instant. Defaults to False.
             encoder_queue_maxsize (int, optional): Maximum number of frames to buffer per camera when using
-                streaming encoding. Defaults to 30 (~1s at 30fps).
+                streaming encoding. When full, add_frame() waits for the encoder. Defaults to 30 (~1s at 30fps).
             repo_type (str, optional): "dataset" (default) or "bucket" for an HF
                 Storage Bucket. With "bucket" and no ``root``, the dataset is read
                 in place from ``hf://buckets/{repo_id}`` (map-style access requires

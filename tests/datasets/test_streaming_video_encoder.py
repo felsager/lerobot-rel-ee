@@ -412,8 +412,8 @@ class TestStreamingVideoEncoder:
         assert encoder._encoder_threads is None
         encoder.close()
 
-    def test_graceful_frame_dropping(self, tmp_path):
-        """Test that full queue drops frames instead of crashing."""
+    def test_full_queue_waits_instead_of_dropping(self, tmp_path):
+        """Test that a full queue makes feed_frame wait, so every frame is encoded."""
         video_keys = [f"{OBS_IMAGES}.cam"]
         encoder = StreamingVideoEncoder(
             fps=30,
@@ -424,23 +424,37 @@ class TestStreamingVideoEncoder:
         )
         encoder.start_episode(video_keys, tmp_path)
 
-        # Feed many frames quickly - with queue_maxsize=1, some will be dropped
+        # Feed frames faster than the encoder can consume them
         num_frames = 50
         for _ in range(num_frames):
             frame = np.random.randint(0, 255, (64, 96, 3), dtype=np.uint8)
             encoder.feed_frame(f"{OBS_IMAGES}.cam", frame)
 
-        # Should not raise - frames are dropped gracefully
         results = encoder.finish_episode()
-        assert f"{OBS_IMAGES}.cam" in results
-
         mp4_path, _ = results[f"{OBS_IMAGES}.cam"]
-        assert mp4_path.exists()
 
-        # Some frames should have been dropped (queue was tiny)
-        dropped = encoder._dropped_frames.get(f"{OBS_IMAGES}.cam", 0)
-        # We can't guarantee drops but can verify no crash occurred
-        assert dropped >= 0
+        with av.open(str(mp4_path)) as container:
+            stream = container.streams.video[0]
+            total_frames = sum(1 for _ in container.decode(stream))
+        assert total_frames == num_frames
+
+        encoder.close()
+
+    def test_finish_episode_raises_on_missing_frames(self, tmp_path):
+        """Test that finish_episode refuses a video with fewer frames than were fed."""
+        video_keys = [f"{OBS_IMAGES}.cam"]
+        encoder = StreamingVideoEncoder(
+            fps=30,
+            rgb_encoder=self._make_encoder_config(vcodec="libsvtav1", pix_fmt="yuv420p", g=2, crf=30),
+        )
+        encoder.start_episode(video_keys, tmp_path)
+        for _ in range(10):
+            encoder.feed_frame(f"{OBS_IMAGES}.cam", np.random.randint(0, 255, (64, 96, 3), dtype=np.uint8))
+
+        # Simulate a frame that was fed but never reached the encoder
+        encoder._frames_fed[f"{OBS_IMAGES}.cam"] += 1
+        with pytest.raises(RuntimeError, match="wrote 10 of 11 frames"):
+            encoder.finish_episode()
 
         encoder.close()
 
