@@ -389,8 +389,9 @@ def decode_video_frames_torchcodec(
     # get metadata for frame information
     metadata = decoder.metadata
     average_fps = metadata.average_fps
-    num_frames = len(decoder)
-    frame_indices = [min(max(round(ts * average_fps), 0), num_frames - 1) for ts in timestamps]
+    # convert timestamps to frame indices
+    frame_indices = [round(ts * average_fps) for ts in timestamps]
+    # retrieve frames based on indices
     frames_batch = decoder.get_frames_at(indices=frame_indices)
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
