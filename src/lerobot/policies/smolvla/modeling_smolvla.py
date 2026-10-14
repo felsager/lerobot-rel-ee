@@ -636,7 +636,9 @@ class VLAFlowMatching(nn.Module):
         device = state_emb.device
 
         states_seq_len = state_emb.shape[1]
-        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        state_mask = torch.full(
+            (bsize, states_seq_len), not self.config.no_proprio, dtype=torch.bool, device=device
+        )
         pad_masks.append(state_mask)
 
         # Set attention masks so that image and language inputs do not attend to state or actions
