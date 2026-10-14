@@ -368,8 +368,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 # Observation queries may add time to masks. Match the latest
                 # image selected above without squeezing away the batch axis.
                 if mask.ndim == 2 and (
-                    mask.shape[1] == 1
-                    or (batch[key].ndim == 5 and mask.shape[1] == batch[key].shape[1])
+                    mask.shape[1] == 1 or (batch[key].ndim == 5 and mask.shape[1] == batch[key].shape[1])
                 ):
                     mask = mask[:, -1]
                 if mask.shape != (bsize,):
@@ -637,7 +636,7 @@ class VLAFlowMatching(nn.Module):
 
         states_seq_len = state_emb.shape[1]
         state_mask = torch.full(
-            (bsize, states_seq_len), not self.config.no_proprio, dtype=torch.bool, device=device
+            (bsize, states_seq_len), self.config.use_proprio, dtype=torch.bool, device=device
         )
         pad_masks.append(state_mask)
 

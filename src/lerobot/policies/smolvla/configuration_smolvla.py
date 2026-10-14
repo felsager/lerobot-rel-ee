@@ -76,7 +76,7 @@ class SmolVLAConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
     train_state_proj: bool = True
-    no_proprio: bool = False  # Mask all state tokens, including gripper, in training and inference.
+    use_proprio: bool = True  # If false mask all state tokens, including gripper, in training and inference.
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -136,8 +136,6 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
-        if self.no_proprio:
-            self.train_state_proj = False
 
     def validate_features(self) -> None:
         if self.input_features is None:
