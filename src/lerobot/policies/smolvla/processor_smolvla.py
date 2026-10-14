@@ -66,11 +66,15 @@ def make_smolvla_pre_post_processors(
     steps = make_default_policy_processor_steps(config, dataset_stats)
     relative_ee_step = RelativeEEActionsStep(
         enabled=config.use_relative_ee,
-        state_frame=config.observation_delta_indices.index(0),
+        state_frame=-1,
         rot_repr=config.rotation_representation,
     )
     absolute_ee_step = AbsoluteEEActionsStep(enabled=config.use_relative_ee, relative_step=relative_ee_step)
-    state_step = EEStateStep(enabled=config.use_relative_ee, rot_repr=config.rotation_representation)
+    state_step = EEStateStep(
+        enabled=config.use_relative_ee,
+        rot_repr=config.rotation_representation,
+        relative=config.use_relative_state,
+    )
 
     input_steps = [
         steps.rename_observations,  # To mimic the same processor as pretrained one

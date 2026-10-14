@@ -126,6 +126,7 @@ def _prepare_relative_ee_stats(
     stats: dict | None = None,
     rot_repr: RotationRepresentation = None,
     identity_rot6d: bool = False,
+    relative_state: bool = False,
 ) -> dict:
     derived_stats = (
         load_or_compute_relative_ee_stats(
@@ -134,6 +135,7 @@ def _prepare_relative_ee_stats(
             cache_dir=dataset.root / "meta" / "relative_ee_stats",
             rot_repr=rot_repr,
             identity_rot6d=identity_rot6d,
+            relative_state=relative_state,
         )
         if stats is None
         else stats
@@ -146,6 +148,7 @@ def _relative_ee_stats_kwargs(cfg: TrainPipelineConfig) -> dict:
     return {
         "rot_repr": cfg.trainable_config.rotation_representation,
         "identity_rot6d": bool(getattr(cfg.trainable_config, "rot6d_identity_norm", False)),
+        "relative_state": bool(getattr(cfg.trainable_config, "use_relative_state", False)),
     }
 
 

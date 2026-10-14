@@ -31,6 +31,7 @@ class SmolVLAConfig(PreTrainedConfig):
     n_action_steps: int = 50
 
     use_relative_ee: bool = False  # Anchor EE actions to the current state.
+    use_relative_state: bool = False  # UMI-style relative state history
     rotation_representation: RotationRepresentation = RotationRepresentation.rot6d
     rot6d_identity_norm: bool = (
         False  # Compute stats that leave action/state rot6d unchanged by normalization.
@@ -123,6 +124,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 raise ValueError("Relative EE mode requires n_obs_steps=1")
             if self.max_state_dim < 10 or self.max_action_dim < 10:
                 raise ValueError("Relative EE mode requires max_state_dim>=10 and max_action_dim>=10")
+        if self.use_relative_state and not self.use_relative_ee:
+            raise ValueError("use_relative_state requires use_relative_ee")
         if self.rot6d_identity_norm and self.rotation_representation != RotationRepresentation.rot6d:
             raise ValueError(
                 f"Using rot6d_identity_norm requires the rotation representation to be {RotationRepresentation.rot6d}"
@@ -168,6 +171,10 @@ class SmolVLAConfig(PreTrainedConfig):
     @property
     def observation_delta_indices(self) -> list:
         return [0]
+
+    @property
+    def state_observation_delta_indices(self) -> list | None:
+        return [-1, 0] if self.use_relative_state else None
 
     @property
     def action_delta_indices(self) -> list:

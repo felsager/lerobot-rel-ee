@@ -15,7 +15,11 @@ import torch
 from datasets import Dataset
 from huggingface_hub.utils import WeakFileLock
 
-from lerobot.processor.relative_ee_action_processor import absolute_ee_to_relative, ee_to_rot_repr
+from lerobot.processor.relative_ee_action_processor import (
+    absolute_ee_to_relative,
+    ee_to_rot_repr,
+    ee_window_to_relative_state,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.rotation_representations import RotationRepresentation
 
@@ -25,7 +29,7 @@ from .io_utils import load_stats, write_stats
 logger = logging.getLogger(__name__)
 
 # Bump when EE conversion, target selection, or statistics computation changes.
-_RELATIVE_EE_STATS_VERSION = 2
+_RELATIVE_EE_STATS_VERSION = 3
 
 
 def relative_ee_stats_cache_key(
@@ -34,10 +38,11 @@ def relative_ee_stats_cache_key(
     episode_indices: np.ndarray,
     chunk_size: int,
     rotation_representation: RotationRepresentation,
+    relative_state: bool = False,
 ) -> str:
     """Hash selected rows in order, excluding normalization choices and video data."""
     digest = hashlib.sha256(
-        f"relative-ee:{_RELATIVE_EE_STATS_VERSION}:{chunk_size}:{rotation_representation}".encode()
+        f"relative-ee:{_RELATIVE_EE_STATS_VERSION}:{chunk_size}:{rotation_representation}:{relative_state}".encode()
     )
     for name, values, dtype in (
         (ACTION, actions, "<f4"),
@@ -51,7 +56,7 @@ def relative_ee_stats_cache_key(
     return digest.hexdigest()
 
 
-# rot6d sits at dims [3:9] of both 10D model vectors: [pos(3), rot6d(6), gripper(1)].
+# rot6d sits at dims [3:9] of every model vector: [pos(3), rot6d(6), ...]
 _ROT6D_SLICE = slice(3, 9)
 
 # Statistics that make every NormalizationMode a no-op on a dimension: MIN_MAX needs
@@ -117,6 +122,7 @@ def load_or_compute_relative_ee_stats(
     cache_dir: Path,
     rot_repr: RotationRepresentation,
     identity_rot6d: bool = False,
+    relative_state: bool = False,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Reuse raw derived stats; apply rotation normalization overrides only in memory."""
     started = time.perf_counter()
@@ -129,7 +135,7 @@ def load_or_compute_relative_ee_stats(
     )
     hash_started = time.perf_counter()
     key = relative_ee_stats_cache_key(
-        columns[ACTION], columns[OBS_STATE], columns["episode_index"], chunk_size, rot_repr
+        columns[ACTION], columns[OBS_STATE], columns["episode_index"], chunk_size, rot_repr, relative_state
     )
     logger.info("Relative EE cache key %s computed in %.2fs", key, time.perf_counter() - hash_started)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -138,7 +144,7 @@ def load_or_compute_relative_ee_stats(
         stats = load_stats(cache_path)
         if stats is None:
             logger.info("Computing relative EE statistics for %s", cache_path)
-            stats = compute_relative_ee_stats(columns, chunk_size, rot_repr)
+            stats = compute_relative_ee_stats(columns, chunk_size, rot_repr, relative_state=relative_state)
             with TemporaryDirectory(dir=cache_dir) as temporary_dir:
                 write_stats(stats, Path(temporary_dir))
                 Path(temporary_dir).replace(cache_path)
@@ -153,14 +159,13 @@ def compute_relative_ee_stats(
     hf_dataset,
     chunk_size: int,
     rot_repr: RotationRepresentation,
-    identity_rot6d: bool = False,
+    relative_state: bool = False,
 ) -> dict[str, dict[str, np.ndarray]]:
     """Compute statistics for the model-facing 10D EE action and state.
 
     Action: every chunk ``action[t : t + chunk_size]`` relative to the EE frame of ``state[t]``,
     within one episode and without targets past the episode end (the padded ones).
-    State: the absolute 10D state (9D pose + 1D gripper).
-    ``identity_rot6d`` forces identity normalization stats on the six rotation dims.
+    State: the absolute 10D state (9D pose + 1D gripper), or with ``relative_state`` the 11D UMI-style state.
     """
     actions = np.asarray(hf_dataset[ACTION], dtype=np.float32)
     states = np.asarray(hf_dataset[OBS_STATE], dtype=np.float32)
@@ -190,7 +195,11 @@ def compute_relative_ee_stats(
         episode_actions = torch.from_numpy(actions[start:end])
         episode_states = torch.from_numpy(states[start:end])
 
-        state_stats.update(ee_to_rot_repr(episode_states, rot_repr).numpy())
+        if relative_state:  # pairs each frame with the previous one; the first frame repeats, like the loader
+            window = torch.stack([torch.cat([episode_states[:1], episode_states[:-1]]), episode_states], 1)
+            state_stats.update(ee_window_to_relative_state(window, rot_repr).numpy())
+        else:
+            state_stats.update(ee_to_rot_repr(episode_states, rot_repr).numpy())
 
         for batch_start in range(0, num_frames, 20_000):
             base_indices = torch.arange(batch_start, min(batch_start + 20_000, num_frames))
@@ -211,10 +220,7 @@ def compute_relative_ee_stats(
         num_action_targets,
     )
 
-    stats = {
+    return {
         ACTION: action_stats.get_statistics(),
         OBS_STATE: state_stats.get_statistics(),
     }
-    if identity_rot6d:
-        _force_identity_rot6d_stats(stats)
-    return stats
