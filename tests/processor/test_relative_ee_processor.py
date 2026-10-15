@@ -372,8 +372,6 @@ def test_relative_ee_stats_cache_reuse(tmp_path: Path) -> None:
                 np.testing.assert_array_equal(loaded[key][name], raw[key][name])
             np.testing.assert_array_equal(identity[key]["mean"][3:9], 0)
             np.testing.assert_array_equal(identity[key]["std"][3:9], 1)
-            np.testing.assert_array_equal(identity[key]["min"][3:9], -1)
-            np.testing.assert_array_equal(identity[key]["max"][3:9], 1)
         load_or_compute_relative_ee_stats(data, 1, tmp_path, rot_repr=ROT6D)
         assert compute.call_count == 2
     assert not list(tmp_path.glob("*.tmp"))
@@ -401,6 +399,25 @@ def test_relative_ee_stats_anchor_on_state_and_stay_within_episodes(rot_repr):
     np.testing.assert_allclose(stats[OBS_STATE]["mean"][0], (0 + 0.5 + 10 + 10.5) / 4, atol=1e-6)
     assert stats[ACTION]["mean"].shape == (4 + ROT_REPR_DIM[rot_repr],)
     assert stats[OBS_STATE]["mean"].shape == (4 + ROT_REPR_DIM[rot_repr],)
+
+
+def test_relative_ee_stats_identity_rot6d():
+    from lerobot.datasets.compute_rel_ee_stats import compute_relative_ee_stats
+
+    actions = np.array(
+        [_ee_x(0.0, 0.0), _ee_x(1.0, 0.2), _ee_x(10.0, 0.4), _ee_x(11.0, 0.6)], dtype=np.float32
+    )
+    stats = compute_relative_ee_stats(
+        {ACTION: actions, OBS_STATE: actions.copy(), "episode_index": np.array([0, 0, 1, 1])},
+        chunk_size=2,
+        identity_rot6d=True,
+        rot_repr=ROT6D,
+    )
+    for key in (ACTION, OBS_STATE):
+        np.testing.assert_allclose(stats[key]["min"][3:9], -1.0)
+        np.testing.assert_allclose(stats[key]["max"][3:9], 1.0)
+        np.testing.assert_allclose(stats[key]["mean"][3:9], 0.0)
+        np.testing.assert_allclose(stats[key]["std"][3:9], 1.0)
 
 
 @pytest.mark.parametrize("selection", [None, [1, 2], [3, 0, 3, 1]])
@@ -434,7 +451,7 @@ def test_arrow_relative_columns_preserve_current_hash(selection, formatter, fixe
     original_format = ds.format.copy()
     actual = _load_relative_ee_columns(ds)
     assert ds.format == original_format
-    legacy = hashlib.sha256(f"relative-ee:3:50:{ROT6D}:False".encode())
+    legacy = hashlib.sha256(f"relative-ee:2:50:{ROT6D}".encode())
     for key, dtype in [(ACTION, "<f4"), (OBS_STATE, "<f4"), ("episode_index", "<i8")]:
         np.testing.assert_array_equal(actual[key], expected[key])
         values = np.ascontiguousarray(expected[key], dtype=dtype)
@@ -474,7 +491,7 @@ def test_empty_relative_columns_preserve_current_hash() -> None:
 
     poses = np.empty((0, 8), dtype=np.float32)
     episodes = np.empty(0, dtype=np.int64)
-    legacy = hashlib.sha256(f"relative-ee:3:50:{ROT6D}:False".encode())
+    legacy = hashlib.sha256(f"relative-ee:2:50:{ROT6D}".encode())
     for name, array, dtype in [
         (ACTION, poses, "<f4"),
         (OBS_STATE, poses, "<f4"),

@@ -126,15 +126,6 @@ def absolute_ee_to_relative(reference: Tensor, target: Tensor, rot_repr: Rotatio
     )
 
 
-def ee_window_to_relative_state(window: Tensor, rot_repr: RotationRepresentation) -> Tensor:
-    """Convert stacked 8D [previous, current] EE states [..., 2, 8] to the UMI-style (5+m)D state: the previous (3+m)D pose and gripper in the current EE frame, then the current gripper."""
-    if window.ndim < 3 or window.shape[-2:] != (2, 8):
-        raise ValueError(f"Expected stacked [previous, current] 8D states, got {tuple(window.shape)}")
-    previous, current = window.double().unbind(-2)  # float64: TF32 matmul error swamps one-frame rotations
-    relative = absolute_ee_to_relative(current, previous, rot_repr)
-    return torch.cat([relative, current[..., -1:]], dim=-1).to(window.dtype)
-
-
 def relative_ee_to_absolute(relative: Tensor, reference: Tensor, rot_repr: RotationRepresentation) -> Tensor:
     """Convert (4+m)D relative EE targets ((3+m)D pose + 1D gripper) in the EE frame of an 8D reference to absolute 8D (7D pose + 1D gripper)."""
     relative_translation, relative_rot, relative_gripper = torch.split(
@@ -271,14 +262,10 @@ class AbsoluteEEActionsStep(AbsoluteActionsProcessorStep):
 @ProcessorStepRegistry.register("ee_state")
 @dataclass
 class EEStateStep(ProcessorStep):
-    """Convert the absolute 8D EE state (7D pose + 1D gripper) to absolute (4+m)D ((3+m)D pose + 1D gripper) for the vlm input.
-
-    With ``relative``, convert a stacked [previous, current] state to the UMI-style (5+m)D relative state instead.
-    """
+    """Convert the absolute 8D EE state (7D pose + 1D gripper) to absolute (4+m)D ((3+m)D pose + 1D gripper) for the vlm input."""
 
     rot_repr: RotationRepresentation = RotationRepresentation.rot6d
     enabled: bool = False
-    relative: bool = False
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if not self.enabled:
@@ -290,16 +277,12 @@ class EEStateStep(ProcessorStep):
 
         result = transition.copy()
         result_observation = dict(observation)
-        result_observation[OBS_STATE] = (
-            ee_window_to_relative_state(state, self.rot_repr)
-            if self.relative
-            else ee_to_rot_repr(state, self.rot_repr)
-        )
+        result_observation[OBS_STATE] = ee_to_rot_repr(state, self.rot_repr)
         result[TransitionKey.OBSERVATION] = result_observation
         return result
 
     def get_config(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "rot_repr": self.rot_repr, "relative": self.relative}
+        return {"enabled": self.enabled, "rot_repr": self.rot_repr}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -311,6 +294,6 @@ class EEStateStep(ProcessorStep):
         if OBS_STATE in observation_features:
             feature = observation_features[OBS_STATE]
             observation_features[OBS_STATE] = PolicyFeature(
-                type=feature.type, shape=((5 if self.relative else 4) + ROT_REPR_DIM[self.rot_repr],)
+                type=feature.type, shape=(4 + ROT_REPR_DIM[self.rot_repr],)
             )
         return result
