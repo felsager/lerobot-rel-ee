@@ -110,7 +110,7 @@ def test_smolvla_relative_ee_pipeline_composition(rot_repr):
         < pre_types.index(EEStateStep)
         < pre_types.index(NormalizerProcessorStep)
     )
-    assert relative_step.state_frame == -1
+    assert relative_step.state_frame == config.observation_delta_indices.index(0)
     assert absolute_step.relative_step is relative_step
     assert relative_step.rot_repr == rot_repr
     assert _step(preprocessor, EEStateStep).rot_repr == rot_repr
@@ -130,7 +130,7 @@ def test_smolvla_relative_ee_processors_save_load_and_reconnect(rot_repr):
     relative_step = _step(loaded_preprocessor, RelativeEEActionsStep)
     absolute_step = _step(loaded_postprocessor, AbsoluteEEActionsStep)
     assert absolute_step.relative_step is relative_step
-    assert relative_step.state_frame == -1
+    assert relative_step.state_frame == 0
     assert relative_step.rot_repr == rot_repr
     assert _step(loaded_preprocessor, EEStateStep).rot_repr == rot_repr
 

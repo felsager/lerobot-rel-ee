@@ -301,9 +301,8 @@ def make_policy(
         if rotation_dim is None:
             raise ValueError(f"Relative EE does not support rotation representation {rot_repr!r}.")
         ee_dim = 4 + rotation_dim
-        state_dim = ee_dim + 1 if getattr(cfg, "use_relative_state", False) else ee_dim  # + current gripper
         features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(ee_dim,))
-        features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(state_dim,))
+        features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(ee_dim,))
 
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
