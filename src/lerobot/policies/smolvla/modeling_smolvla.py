@@ -192,7 +192,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 model_value.rtc_processor = self.rtc_processor
 
     def get_optim_params(self) -> dict:
-        return self.parameters()
+        scale = self.config.optimizer_vlm_lr_scale
+        if scale == 1.0:
+            return self.parameters()
+        # Two groups: the rest at optimizer_lr, the VLM at optimizer_lr * scale. The scheduler scales both groups
+        # by the same factor, so the ratio holds for the whole run. The logged `lr` is the first group's.
+        vlm, rest = [], []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                (vlm if name.startswith("model.vlm_with_expert.vlm.") else rest).append(param)
+        groups = [{"params": rest}]
+        if vlm:
+            groups.append({"params": vlm, "lr": self.config.optimizer_lr * scale})
+        return groups
 
     def _get_action_chunk(
         self,

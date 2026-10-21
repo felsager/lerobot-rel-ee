@@ -85,6 +85,9 @@ class SmolVLAConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-10
     optimizer_grad_clip_norm: float = 10
     optimizer_fused: bool | None = None
+    optimizer_vlm_lr_scale: float = (
+        1.0  # VLM (vision encoder, connector, text model) lr = optimizer_lr * this scale.
+    )
 
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
