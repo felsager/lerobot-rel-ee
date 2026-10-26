@@ -174,7 +174,7 @@ def make_pi05_pre_post_processors(
         steps.normalize,
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
-            include_state_in_prompt=not config.use_proprioceptive_memory,
+            include_state_in_prompt=config.use_proprio and not config.use_proprioceptive_memory,
         ),
         TokenizerProcessorStep(
             tokenizer_name=config.text_tokenizer_name,
