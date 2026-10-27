@@ -124,7 +124,7 @@ def _prepare_relative_ee_stats(
     dataset: LeRobotDataset,
     chunk_size: int,
     stats: dict | None = None,
-    rot_repr: RotationRepresentation = None,
+    rot_repr: RotationRepresentation = RotationRepresentation.rot6d,
     identity_rot6d: bool = False,
 ) -> dict:
     derived_stats = (

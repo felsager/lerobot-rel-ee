@@ -115,7 +115,7 @@ def main(cfg: LeKiwiServerConfig) -> None:
             # Send the observation to the remote agent
             try:
                 host.zmq_observation_socket.send_multipart(
-                    [json.dumps(header).encode()] + jpeg_frames, flags=zmq.NOBLOCK
+                    [json.dumps(header).encode(), *jpeg_frames], flags=zmq.NOBLOCK
                 )
             except zmq.Again:
                 logging.info("Dropping observation, no client connected")

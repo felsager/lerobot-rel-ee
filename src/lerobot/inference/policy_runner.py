@@ -36,6 +36,7 @@ from lerobot.processor import (
     RenameObservationsProcessorStep,
 )
 from lerobot.utils import OBS_STATE, QUERY_KIND, QUERY_TEXT
+from lerobot.utils.rotation_representations import get_rotation_dim
 
 from .contracts import (
     DEFAULT_MAX_TEXT_INPUT_CHARS,
@@ -196,12 +197,18 @@ class PolicyRunner:
         if self._relative_ee_step is not None:
             if state is None or state.kind != "tensor" or state.shape != (8,):
                 raise ValueError("Relative EE requires an 8D canonical state.")
-            if not any(isinstance(step, EEStateStep) and step.enabled for step in self.preprocessor.steps):
+            state_steps = [
+                step for step in self.preprocessor.steps if isinstance(step, EEStateStep) and step.enabled
+            ]
+            if len(state_steps) != 1:
                 raise ValueError(
                     "Relative EE requires an enabled EEStateStep to convert the canonical state."
                 )
+            if state_steps[0].rot_repr != self._relative_ee_step.rot_repr:
+                raise ValueError("Relative EE state and action rotation representations must match.")
+            model_dim = 4 + get_rotation_dim(self._relative_ee_step.rot_repr)
             features = tuple(
-                replace(feature, shape=(10,), names=()) if feature.name == OBS_STATE else feature
+                replace(feature, shape=(model_dim,), names=()) if feature.name == OBS_STATE else feature
                 for feature in features
             )
         self.policy.validate_chunk_input_features(features)
@@ -209,8 +216,10 @@ class PolicyRunner:
         action = self.capabilities.action_feature
         if output is None or action.name != "action":
             raise ValueError("Canonical action feature differs from policy output_features.")
-        if self._relative_ee_step is not None and (action.shape != (8,) or tuple(output.shape) != (10,)):
-            raise ValueError("Relative EE requires 8D canonical actions and 10D model actions.")
+        if self._relative_ee_step is not None:
+            model_dim = 4 + get_rotation_dim(self._relative_ee_step.rot_repr)
+            if action.shape != (8,) or tuple(output.shape) != (model_dim,):
+                raise ValueError(f"Relative EE requires 8D canonical actions and {model_dim}D model actions.")
         if self._relative_ee_step is None and action.shape != tuple(output.shape):
             raise ValueError("Canonical action feature differs from policy output_features.")
         if action.kind != "tensor" or len(action.shape) != 1 or action.dtype != "float32":

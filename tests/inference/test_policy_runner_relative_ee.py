@@ -21,10 +21,13 @@ import pytest
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
-from lerobot.inference import FeatureSpec, ObservationSnapshot, PolicyRunner
+from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, PolicyRunner
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import AbsoluteEEActionsStep, EEStateStep, RelativeEEActionsStep
 from lerobot.processor.factory import make_policy_processor_pipelines
+from lerobot.processor.relative_ee_action_processor import ee_to_rot_repr, to_absolute_ee_actions
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
+from lerobot.utils.rotation_representations import RotationRepresentation, get_rotation_dim
 from tests.inference.policy_helpers import ConformingPolicy, tiny_config
 
 _CAMERA = "observation.images.camera"
@@ -35,22 +38,34 @@ class _EEPolicy(ConformingPolicy):
     name = "relative_ee_input_conformance"
 
     def predict_action_chunk(self, batch, **kwargs):
+        self.last_kwargs = kwargs
         self.prepared_state = batch[OBS_STATE].clone()
-        action = torch.tensor([0.1, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5])
-        return action.expand(1, self.config.chunk_size, 10).clone()
+        action = ee_to_rot_repr(
+            torch.tensor([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5]),
+            self.config.rotation_representation,
+        )
+        return action.expand(1, self.config.chunk_size, action.shape[-1]).clone()
 
 
-@pytest.fixture
-def ee_deployment():
+@pytest.fixture(
+    params=[
+        representation
+        for representation in RotationRepresentation
+        if representation != RotationRepresentation.riemannian_fancy_stuff
+    ]
+)
+def ee_deployment(request):
     config = tiny_config()
-    config.input_features[OBS_STATE] = PolicyFeature(FeatureType.STATE, (10,))
+    config.rotation_representation = request.param
+    model_dim = 4 + get_rotation_dim(request.param)
+    config.input_features[OBS_STATE] = PolicyFeature(FeatureType.STATE, (model_dim,))
     config.input_features[_CAMERA] = PolicyFeature(FeatureType.VISUAL, (3, 16, 16))
-    config.output_features[ACTION] = PolicyFeature(FeatureType.ACTION, (10,))
+    config.output_features[ACTION] = PolicyFeature(FeatureType.ACTION, (model_dim,))
     policy = _EEPolicy(config)
-    relative = RelativeEEActionsStep()
+    relative = RelativeEEActionsStep(enabled=True, rot_repr=request.param)
     pre, post = make_policy_processor_pipelines(
-        input_steps=[relative, EEStateStep()],
-        output_steps=[AbsoluteEEActionsStep(relative_step=relative)],
+        input_steps=[relative, EEStateStep(enabled=True, rot_repr=request.param)],
+        output_steps=[AbsoluteEEActionsStep(enabled=True, relative_step=relative)],
     )
     features = (
         FeatureSpec(
@@ -100,10 +115,11 @@ def test_runner_accepts_raw_ee_state_and_preserves_wire_schema(ee_deployment, mo
     torch.testing.assert_close(
         result.canonical_actions[0], torch.from_numpy(state) + torch.tensor([0.1, 0, 0, 0, 0, 0, 0, 0])
     )
-    assert policy.prepared_state.shape == (1, 10)
+    model_dim = 4 + get_rotation_dim(policy.config.rotation_representation)
+    assert policy.prepared_state.shape == (1, model_dim)
     assert runner.capabilities.features == kwargs["features"]
     assert runner.capabilities.features[0].names == _STATE_NAMES
-    assert policy.config.input_features[OBS_STATE].shape == (10,)
+    assert policy.config.input_features[OBS_STATE].shape == (model_dim,)
 
 
 @pytest.mark.parametrize("shape", [(7,), (10,)])
@@ -132,4 +148,46 @@ def test_runner_still_rejects_unrelated_input_mismatch(ee_deployment):
         for feature in kwargs["features"]
     )
     with pytest.raises(ValueError, match="Tensor feature shape differs.*observation.environment_state"):
+        PolicyRunner(policy, pre, post, **kwargs)
+
+
+def test_runner_rejects_mismatched_state_and_action_rotation_representations(ee_deployment):
+    policy, pre, post, kwargs = ee_deployment
+    pre.steps[-1].rot_repr = (
+        RotationRepresentation.quaternion
+        if pre.steps[0].rot_repr != RotationRepresentation.quaternion
+        else RotationRepresentation.rot6d
+    )
+    with pytest.raises(ValueError, match="rotation representations must match"):
+        PolicyRunner(policy, pre, post, **kwargs)
+
+
+def test_guided_rtc_reanchors_each_rotation_representation(ee_deployment):
+    policy, pre, post, kwargs = ee_deployment
+    policy.config.rtc_config = RTCConfig(execution_horizon=4)
+    runner = PolicyRunner(policy, pre, post, modes=(ExecutionMode.RTC_GUIDED,), **kwargs)
+    features = {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in kwargs["features"]}
+    features[OBS_STATE][6] = 1.0
+    first = runner.predict(ObservationSnapshot(features, 1.0, "pick"), mode=ExecutionMode.RTC_GUIDED)
+    features[OBS_STATE] = np.array([1, 2, 3, 0, 0, 2**-0.5, 2**-0.5, 0.5], dtype=np.float32)
+    second = runner.predict(
+        ObservationSnapshot(features, 2.0, "pick"),
+        mode=ExecutionMode.RTC_GUIDED,
+        model_continuation=first.model_actions[3:],
+        canonical_continuation=first.canonical_actions[3:],
+    )
+    prefix = policy.last_kwargs["prev_chunk_left_over"]
+    decoded = to_absolute_ee_actions(
+        prefix, torch.from_numpy(features[OBS_STATE]), policy.config.rotation_representation
+    )
+    torch.testing.assert_close(decoded, first.canonical_actions[3:7], atol=1e-6, rtol=1e-5)
+    assert torch.isfinite(second.canonical_actions).all()
+    assert second.canonical_actions.shape == (8, 8)
+
+
+def test_runner_rejects_model_action_width_inconsistent_with_rotation_representation(ee_deployment):
+    policy, pre, post, kwargs = ee_deployment
+    expected_dim = 4 + get_rotation_dim(policy.config.rotation_representation)
+    policy.config.output_features[ACTION] = PolicyFeature(FeatureType.ACTION, (expected_dim + 1,))
+    with pytest.raises(ValueError, match=f"{expected_dim}D model actions"):
         PolicyRunner(policy, pre, post, **kwargs)

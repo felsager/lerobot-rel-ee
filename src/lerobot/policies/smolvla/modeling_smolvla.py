@@ -61,6 +61,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
 from lerobot.configs import FeatureType
+from lerobot.optim.optimizers import OptimizerParams
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
@@ -191,17 +192,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if model_value is not None:
                 model_value.rtc_processor = self.rtc_processor
 
-    def get_optim_params(self) -> dict:
+    def get_optim_params(self) -> OptimizerParams:
         scale = self.config.optimizer_vlm_lr_scale
         if scale == 1.0:
             return self.parameters()
         # Two groups: the rest at optimizer_lr, the VLM at optimizer_lr * scale. The scheduler scales both groups
         # by the same factor, so the ratio holds for the whole run. The logged `lr` is the first group's.
-        vlm, rest = [], []
+        vlm: list[nn.Parameter] = []
+        rest: list[nn.Parameter] = []
         for name, param in self.named_parameters():
             if param.requires_grad:
                 (vlm if name.startswith("model.vlm_with_expert.vlm.") else rest).append(param)
-        groups = [{"params": rest}]
+        groups: list[dict[str, Any]] = [{"params": rest}]
         if vlm:
             groups.append({"params": vlm, "lr": self.config.optimizer_lr * scale})
         return groups

@@ -448,11 +448,6 @@ def decode_video_frames_torchcodec(
     average_fps = metadata.average_fps
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
-    # retrieve frames based on indices
-    num_frames = len(decoder)
-    frame_indices = [min(max(round(ts * average_fps), 0), num_frames - 1) for ts in timestamps]
-    # convert timestamps to frame indices
-    frame_indices = [round(ts * average_fps) for ts in timestamps]
     # retrieve frames based on indices: get_frames_at returns exactly one frame per
     # requested index, in order, so frame i already corresponds to timestamps[i] --
     # no nearest-match/re-stack needed (that redundant copy dominates decode overhead).

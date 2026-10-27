@@ -19,3 +19,11 @@ ROT_REPR_DIM = {
     RotationRepresentation.riemannian_fancy_stuff: None,
 }
 """Number of components in each rotation representation, denoted by 'm' in pose dimensions."""
+
+
+def get_rotation_dim(rot_repr: RotationRepresentation) -> int:
+    """Return the dimension of a supported rotation representation."""
+    dimension = ROT_REPR_DIM[rot_repr]
+    if dimension is None:
+        raise ValueError(f"Unsupported rotation representation: {rot_repr!r}")
+    return dimension

@@ -39,6 +39,7 @@ from lerobot.remote_inference import deployment as serving
 from lerobot.remote_inference.configs import ExecutionConfig, ModelConfig, ServerConfig
 from lerobot.transport.zenoh import ZenohConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.rotation_representations import RotationRepresentation, get_rotation_dim
 from tests.inference.policy_helpers import ConformingPolicy, observation, processors, tiny_config
 
 
@@ -78,21 +79,32 @@ def test_server_loads_saved_act_and_processors_warms_and_resets(deployment):
     assert debug_identity == identity, "console verbosity must not invalidate a pinned artifact"
 
 
-def test_relative_ee_warmup_uses_valid_reference_pose(deployment: ServerConfig, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "rot_repr",
+    [
+        representation
+        for representation in RotationRepresentation
+        if representation != RotationRepresentation.riemannian_fancy_stuff
+    ],
+)
+def test_relative_ee_warmup_uses_valid_reference_pose(
+    deployment: ServerConfig, tmp_path: Path, rot_repr: RotationRepresentation
+) -> None:
     config = tiny_config()
-    config.input_features[OBS_STATE] = PolicyFeature(FeatureType.STATE, (10,))
-    config.output_features[ACTION] = PolicyFeature(FeatureType.ACTION, (10,))
+    model_dim = 4 + get_rotation_dim(rot_repr)
+    config.input_features[OBS_STATE] = PolicyFeature(FeatureType.STATE, (model_dim,))
+    config.output_features[ACTION] = PolicyFeature(FeatureType.ACTION, (model_dim,))
     checkpoint = tmp_path / "ee_checkpoint"
     ACTPolicy(config).save_pretrained(checkpoint)
-    relative = RelativeEEActionsStep()
+    relative = RelativeEEActionsStep(enabled=True, rot_repr=rot_repr)
     pre, post = make_policy_processor_pipelines(
         input_steps=[
             RenameObservationsProcessorStep(rename_map={}),
             DeviceProcessorStep(device="cpu"),
             relative,
-            EEStateStep(),
+            EEStateStep(enabled=True, rot_repr=rot_repr),
         ],
-        output_steps=[AbsoluteEEActionsStep(relative_step=relative)],
+        output_steps=[AbsoluteEEActionsStep(enabled=True, relative_step=relative)],
     )
     pre.save_pretrained(checkpoint)
     post.save_pretrained(checkpoint)

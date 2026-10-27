@@ -40,7 +40,7 @@ from lerobot.processor.relative_action_processor import (
     RelativeActionsProcessorStep,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
-from lerobot.utils.rotation_representations import ROT_REPR_DIM, RotationRepresentation
+from lerobot.utils.rotation_representations import RotationRepresentation, get_rotation_dim
 
 from .pipeline import ProcessorStep, ProcessorStepRegistry
 
@@ -129,7 +129,7 @@ def absolute_ee_to_relative(reference: Tensor, target: Tensor, rot_repr: Rotatio
 def relative_ee_to_absolute(relative: Tensor, reference: Tensor, rot_repr: RotationRepresentation) -> Tensor:
     """Convert (4+m)D relative EE targets ((3+m)D pose + 1D gripper) in the EE frame of an 8D reference to absolute 8D (7D pose + 1D gripper)."""
     relative_translation, relative_rot, relative_gripper = torch.split(
-        relative, [3, ROT_REPR_DIM[rot_repr], 1], dim=-1
+        relative, [3, get_rotation_dim(rot_repr), 1], dim=-1
     )
     reference_translation, reference_quat, _ = torch.split(reference, [3, 4, 1], dim=-1)
 
@@ -155,9 +155,10 @@ def to_relative_ee_actions(actions: Tensor, state: Tensor, rot_repr: RotationRep
 
 
 def to_absolute_ee_actions(actions: Tensor, state: Tensor, rot_repr: RotationRepresentation) -> Tensor:
-    if actions.shape[-1] != 4 + ROT_REPR_DIM[rot_repr] or state.shape[-1] != 8:
+    action_dim = 4 + get_rotation_dim(rot_repr)
+    if actions.shape[-1] != action_dim or state.shape[-1] != 8:
         raise ValueError(
-            f"Relative EE requires {4 + ROT_REPR_DIM[rot_repr]}D actions and an 8D reference state; "
+            f"Relative EE requires {action_dim}D actions and an 8D reference state; "
             f"got action={actions.shape[-1]}D and state={state.shape[-1]}D"
         )
     actions = actions.float()
@@ -215,7 +216,7 @@ class RelativeEEActionsStep(RelativeActionsProcessorStep):
         if ACTION in action_features:
             feature = action_features[ACTION]
             action_features[ACTION] = PolicyFeature(
-                type=feature.type, shape=(4 + ROT_REPR_DIM[self.rot_repr],)
+                type=feature.type, shape=(4 + get_rotation_dim(self.rot_repr),)
             )
         return result
 
@@ -272,7 +273,7 @@ class EEStateStep(ProcessorStep):
             return transition
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
-        if state is None:
+        if observation is None or state is None:
             return transition
 
         result = transition.copy()
@@ -294,6 +295,6 @@ class EEStateStep(ProcessorStep):
         if OBS_STATE in observation_features:
             feature = observation_features[OBS_STATE]
             observation_features[OBS_STATE] = PolicyFeature(
-                type=feature.type, shape=(4 + ROT_REPR_DIM[self.rot_repr],)
+                type=feature.type, shape=(4 + get_rotation_dim(self.rot_repr),)
             )
         return result

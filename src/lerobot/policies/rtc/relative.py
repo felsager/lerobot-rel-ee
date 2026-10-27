@@ -87,4 +87,7 @@ def reanchor_relative_ee_rtc_prefix(
     transition = create_transition(action=to_relative_ee_actions(actions, state, rot_repr))
     if normalizer_step is not None:
         transition = normalizer_step(transition)
-    return transition[TransitionKey.ACTION].to(policy_device)
+    action = transition[TransitionKey.ACTION]
+    if not isinstance(action, torch.Tensor):
+        raise ValueError(f"Expected a tensor action after normalization, got {type(action).__name__}.")
+    return action.to(policy_device)
