@@ -177,6 +177,9 @@ class RTCInferenceEngine(InferenceEngine):
         self._reset_pending = False
         self._hold = HoldState()
         self._active_query_generation = 0
+        for step in preprocessor.steps:
+            if isinstance(step, RelativeActionsProcessorStep):
+                step.bind_action_queue(None)
         self._language_preprocessor = deepcopy(preprocessor)
         if getattr(robot_wrapper, "supports_position_hold", False):
             robot_wrapper.configure_position_hold()

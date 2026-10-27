@@ -148,6 +148,8 @@ class PolicyRunner:
         )
         # Chunk callers never use select_action's private playback queue. A prior
         # sync binding must not hold an old anchor across complete chunk calls.
+        if self._relative_ee_step is not None:
+            self._relative_ee_step.bind_action_queue(None)
         if self._relative_step is not None:
             self._relative_step.bind_action_queue(None)
             action_names = self.capabilities.action_feature.names
