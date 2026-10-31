@@ -176,6 +176,11 @@ lerobot-train \
   - [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base) (specifically trained on the Libero dataset)
 - **`--policy.optimizer_fused=true`**: Uses fused AdamW for faster optimizer steps; this flag is ignored when resuming a run
 
+### Optional end-effector prompt identifier
+
+Set `--policy.prompt_control_prefix=true` to add the EE control-mode tag during training and inference (default: `false`).
+Uses `end effector cam frame` with `use_relative_ee=true`, otherwise `end effector`; action conversion is unchanged.
+
 ### Optional training-time RTC
 
 Pi05 can optionally learn action-prefix conditioning for efficient

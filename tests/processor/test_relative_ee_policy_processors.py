@@ -362,3 +362,94 @@ def test_pi05_non_ee_modes_survive_pipeline_reload(tmp_path: Path, mode: str) ->
     torch.testing.assert_close(processed[ACTION], expected_actions / 4)
     torch.testing.assert_close(processed[OBS_STATE], state / 2)
     torch.testing.assert_close(post(processed[ACTION]), target, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("prompt_control_prefix", [False, True])
+@pytest.mark.parametrize("relative_ee", [False, True])
+@pytest.mark.parametrize("include_state", [False, True])
+@pytest.mark.parametrize("reload", [False, True], ids=["fresh", "reloaded"])
+def test_pi05_prompt_control_prefix_roundtrip(
+    tmp_path: Path, prompt_control_prefix: bool, relative_ee: bool, include_state: bool, reload: bool
+) -> None:
+    config = _pi05_config(RotationRepresentation.rot6d, mode="ee" if relative_ee else "absolute")
+    config.prompt_control_prefix = prompt_control_prefix
+    config.use_proprio = include_state
+    dim = config.output_features[ACTION].shape[0]
+    pre, post = make_pi05_pre_post_processors(config, _pi05_quantile_stats(dim))
+    if reload:
+        config.save_pretrained(tmp_path)
+        pre.save_pretrained(tmp_path)
+        post.save_pretrained(tmp_path)
+        config = PI05Config.from_pretrained(tmp_path)
+        assert config.prompt_control_prefix == prompt_control_prefix
+        assert config.use_relative_ee == relative_ee
+        pre, post = make_pre_post_processors(config, pretrained_path=tmp_path)
+
+    mode = "end effector cam frame" if relative_ee else "end effector"
+    prefix = f"<control mode> {mode} </control mode> " if prompt_control_prefix else ""
+    tasks = ["pick_up"]
+    if prompt_control_prefix:
+        tasks += [f"<control_mode> {mode} </control_mode> pick_up"]
+    for task in tasks:
+        batch = _pi05_ee_batch(memory=False)
+        batch["task"] = [task]
+        target = batch[ACTION].clone()
+        processed = pre(batch)
+        prompt = _step(pre, TokenizerProcessorStep).input_tokenizer.prompts[0]
+        assert prompt.startswith(f"Task: {prefix}pick up")
+        assert prompt.count("<control mode>") == prompt_control_prefix
+        assert (", State:" in prompt) == include_state
+        torch.testing.assert_close(post(processed[ACTION]), target, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("relative_ee", [False, True])
+def test_pi05_prompt_control_prefix_rejects_conflicting_dataset_tag(relative_ee: bool) -> None:
+    config = _pi05_config(RotationRepresentation.rot6d, mode="ee" if relative_ee else "absolute")
+    config.prompt_control_prefix = True
+    pre, _ = make_pi05_pre_post_processors(
+        config, _pi05_quantile_stats(config.output_features[ACTION].shape[0])
+    )
+    batch = _pi05_ee_batch(memory=False)
+    mode = "end effector" if relative_ee else "end effector cam frame"
+    batch["task"] = [f"<control_mode> {mode} </control_mode> pick_up"]
+    with pytest.raises(ValueError, match="conflicts"):
+        pre(batch)
+
+
+@pytest.mark.parametrize("relative_ee", [False, True])
+def test_pi05_prompt_control_prefix_overrides_base_checkpoint(tmp_path: Path, relative_ee: bool) -> None:
+    config = _pi05_config(RotationRepresentation.rot6d, mode="ee" if relative_ee else "absolute")
+    pre, post = make_pi05_pre_post_processors(
+        config, _pi05_quantile_stats(config.output_features[ACTION].shape[0])
+    )
+    pre.save_pretrained(tmp_path)
+    post.save_pretrained(tmp_path)
+    # Existing base checkpoints have neither prefix setting in the saved prompt processor.
+    path = tmp_path / "policy_preprocessor.json"
+    saved = json.loads(path.read_text())
+    for step in saved["steps"]:
+        if step.get("registry_name") == "pi05_prepare_state_tokenizer_processor_step":
+            step["config"].pop("prompt_control_prefix", None)
+            step["config"].pop("use_relative_ee", None)
+    path.write_text(json.dumps(saved))
+    config.prompt_control_prefix = True
+    pre, _ = make_pre_post_processors(
+        config,
+        pretrained_path=tmp_path,
+        preprocessor_overrides={
+            "pi05_prepare_state_tokenizer_processor_step": {
+                "prompt_control_prefix": config.prompt_control_prefix,
+                "use_relative_ee": config.use_relative_ee,
+            }
+        },
+    )
+    pre(_pi05_ee_batch(memory=False))
+    prompt = _step(pre, TokenizerProcessorStep).input_tokenizer.prompts[0]
+    mode = "end effector cam frame" if relative_ee else "end effector"
+    assert prompt.startswith(f"Task: <control mode> {mode} </control mode> pick up")
+
+
+def test_pi05_prompt_control_prefix_validation() -> None:
+    assert PI05Config().prompt_control_prefix is False
+    with pytest.raises(ValueError, match="prompt_control_prefix"):
+        PI05Config(prompt_control_prefix="end_effector")

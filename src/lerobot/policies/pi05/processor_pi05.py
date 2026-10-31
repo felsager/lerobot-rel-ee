@@ -51,6 +51,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    prompt_control_prefix: bool = False
+    use_relative_ee: bool = False
     # MEM section III-D represents proprioception with a linear projection into the
     # backbone instead of discretized prompt tokens, so the state is carried once.
     # Set from `PI05Config.use_proprioceptive_memory`; stock PI0.5 keeps it in the prompt.
@@ -84,6 +86,13 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         full_prompts = []
         for i, task in enumerate(tasks):
             cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            if self.prompt_control_prefix:
+                mode = "end effector cam frame" if self.use_relative_ee else "end effector"
+                prefix = f"<control mode> {mode} </control mode> "
+                if not cleaned_text.startswith(prefix):
+                    if cleaned_text.startswith("<control mode>"):
+                        raise ValueError("Task control-mode tag conflicts with policy.prompt_control_prefix")
+                    cleaned_text = prefix + cleaned_text
             if discretized_states is None:
                 full_prompt = f"Task: {cleaned_text};\nAction: "
             else:
@@ -100,6 +109,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         return {
             "max_state_dim": self.max_state_dim,
             "task_key": self.task_key,
+            "prompt_control_prefix": self.prompt_control_prefix,
+            "use_relative_ee": self.use_relative_ee,
             "include_state_in_prompt": self.include_state_in_prompt,
         }
 
@@ -174,6 +185,8 @@ def make_pi05_pre_post_processors(
         steps.normalize,
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
+            prompt_control_prefix=config.prompt_control_prefix,
+            use_relative_ee=config.use_relative_ee,
             include_state_in_prompt=config.use_proprio and not config.use_proprioceptive_memory,
         ),
         TokenizerProcessorStep(

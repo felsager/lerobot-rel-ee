@@ -39,6 +39,8 @@ class PI05Config(PreTrainedConfig):
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
+    # Enable PI's EE prompt tag, selecting local deltas when use_relative_ee is enabled.
+    prompt_control_prefix: bool = False
     use_relative_ee: bool = False  # Anchor EE actions to the current state.
     rotation_representation: RotationRepresentation = RotationRepresentation.rot6d
     rot6d_identity_norm: bool = (
@@ -135,6 +137,8 @@ class PI05Config(PreTrainedConfig):
         super().__post_init__()
 
         # Validate configuration
+        if not isinstance(self.prompt_control_prefix, bool):
+            raise ValueError("prompt_control_prefix must be a boolean")
         if self.use_relative_ee:
             if self.use_relative_actions:
                 raise ValueError("Relative EE mode cannot be used with 'use_relative_actions")

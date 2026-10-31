@@ -713,6 +713,11 @@ def train(cfg: TrainPipelineConfig) -> None:
                 "action_names": getattr(active_cfg, "action_feature_names", None),
             }
             postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
+        if active_cfg.type == "pi05":
+            preprocessor_overrides["pi05_prepare_state_tokenizer_processor_step"] = {
+                "prompt_control_prefix": getattr(active_cfg, "prompt_control_prefix", False),
+                "use_relative_ee": getattr(active_cfg, "use_relative_ee", False),
+            }
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
         processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
