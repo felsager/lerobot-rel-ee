@@ -79,6 +79,7 @@ def _prepare_continuation(
     relative_step: RelativeActionsProcessorStep | None,
     relative_ee_step: RelativeEEActionsStep | None,
     normalizer_step: NormalizerProcessorStep | None,
+    current_state=None,
 ) -> torch.Tensor | None:
     if model is None or model.numel() == 0:
         return None
@@ -94,15 +95,11 @@ def _prepare_continuation(
     if relative_ee_step is not None:
         if canonical is None or canonical.shape != (model.shape[0], 8) or not torch.isfinite(canonical).all():
             raise ValueError("Relative EE RTC requires matching finite canonical continuation shaped [T, 8].")
-        state = relative_ee_step.get_cached_state()
+        state = current_state if current_state is not None else relative_ee_step.get_cached_state()
         if state is None:
-            raise ValueError("Relative EE RTC preprocessor did not cache the current raw state.")
+            raise ValueError("Relative EE RTC preprocessor requires the current raw state.")
         reanchored = reanchor_relative_ee_rtc_prefix(
-            canonical,
-            state,
-            normalizer_step,
-            device,
-            rot_repr=relative_ee_step.rot_repr,
+            canonical, state, normalizer_step, device, rot_repr=relative_ee_step.rot_repr
         )
         if reanchored.shape != model.shape:
             raise ValueError("Re-anchored EE continuation must match the model action shape.")
@@ -110,9 +107,9 @@ def _prepare_continuation(
     elif relative_step is not None:
         if canonical is None or canonical.shape != model.shape or not torch.isfinite(canonical).all():
             raise ValueError("Relative RTC requires matching finite canonical continuation.")
-        state = relative_step.get_cached_state()
+        state = current_state if current_state is not None else relative_step.get_cached_state()
         if state is None:
-            raise ValueError("Relative RTC preprocessor did not cache the current raw state.")
+            raise ValueError("Relative RTC preprocessor requires the current raw state.")
         model = reanchor_relative_rtc_prefix(canonical, state, relative_step, normalizer_step, device)
 
     model = model.to(device)
