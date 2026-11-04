@@ -353,6 +353,23 @@ or introduce camera-specific recovery.
 <details>
 <summary>Compilation and instruction changes</summary>
 
+Enable local compilation with these top-level rollout YAML fields (also available
+as CLI flags):
+
+```yaml
+use_torch_compile: true
+torch_compile_mode: default
+```
+
+Native PI0/PI05 constructors also receive the selected `torch_compile_mode`. These
+are local-inference settings; remote inference is configured on its server.
+
+PyTorch reuses matching entries in its compiler cache automatically. A first
+full-graph compilation can take several minutes; allow enough
+`inference.startup_timeout_s` (for example, `600` for initial compilation).
+Warmup can compile additional first-chunk/prefixed variants, so a cached benchmark
+graph does not guarantee that every rollout variant is already cached.
+
 RTC compilation warms both initial and prefixed calls, including a representative
 nonzero delay, before motion. Although `--compile_warmup_inferences` defaults to 2,
 enabled RTC requires at least 3; startup logs report the effective count. Warmup must

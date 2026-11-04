@@ -795,3 +795,66 @@ def test_denoise_step_deterministic_with_same_inputs():
 
     # Should produce identical results
     assert torch.allclose(result1, result2)
+
+
+def test_guidance_correction_is_the_weighted_error_without_a_backward_pass(monkeypatch):
+    """Guards the deliberate J = I: differentiating the denoiser here weakened real handoffs."""
+    processor = RTCProcessor(
+        RTCConfig(debug=True, execution_horizon=2, prefix_attention_schedule=RTCAttentionSchedule.ONES)
+    )
+    x = torch.tensor([[[0.3, -0.2], [0.1, 0.4]]])
+    previous = torch.tensor([[[0.6, 0.2], [-0.1, 0.5]]])
+
+    def velocity(value):
+        assert not value.requires_grad
+        return value.sin()
+
+    def unexpected_gradient(*args, **kwargs):
+        pytest.fail("Guidance must not differentiate the denoiser")
+
+    monkeypatch.setattr(torch.autograd, "grad", unexpected_gradient)
+    with torch.no_grad():
+        result = processor.denoise_step(x, previous, 1, 0.5, velocity)
+        error = previous - (x - 0.5 * x.sin())
+    tracked = processor.get_all_debug_steps()[0]
+    torch.testing.assert_close(tracked.correction, error, rtol=0, atol=0)
+    # At t=0.5 the configured guidance coefficient is 2.
+    torch.testing.assert_close(result, x.sin() - 2 * error, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+        ),
+    ],
+)
+@pytest.mark.parametrize("time", [0.0, 0.1, 0.3, 0.7, 0.9, 1.0])
+def test_double_scalar_time_preserves_python_guidance_rounding(device, time):
+    """Complement in double, then round to the historical scalar tensor dtype."""
+    processor = RTCProcessor(
+        RTCConfig(
+            debug=True,
+            execution_horizon=3,
+            prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+        )
+    )
+    x = torch.ones(2, 5, 3, device=device)
+    previous = torch.full_like(x, 0.1)
+    scalar = torch.tensor(time, dtype=torch.float64, device=device)
+    with torch.no_grad():
+        python_result = processor.denoise_step(x, previous, 1, time, lambda value: value.sin())
+        tensor_result = processor.denoise_step(x, previous, 1, scalar, lambda value: value.sin())
+    torch.testing.assert_close(tensor_result, python_result, rtol=0, atol=0)
+    tau = torch.as_tensor(1 - time)
+    cap = torch.as_tensor(10.0)
+    squared = (1 - tau) ** 2
+    inv_r2 = (squared + tau**2) / squared
+    coefficient = torch.nan_to_num((1 - tau) / tau, posinf=10.0)
+    expected = torch.minimum(torch.nan_to_num(coefficient * inv_r2, posinf=10.0), cap)
+    tracked = processor.get_all_debug_steps()[-1]
+    assert tracked.guidance_weight.device == x.device
+    assert tracked.guidance_weight.dtype == torch.get_default_dtype()
+    torch.testing.assert_close(tracked.guidance_weight, expected.to(device), rtol=0, atol=0)

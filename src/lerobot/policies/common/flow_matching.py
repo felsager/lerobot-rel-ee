@@ -312,9 +312,9 @@ def euler_integrate(
         execution_horizon: RTC guidance parameter, forwarded verbatim.
         hard_prefix: Optional clean action prefix to clamp throughout denoising.
         hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
-        precompute_times: Create the float32 timestep schedule on the target device once,
-            avoiding a scalar tensor allocation/host transfer in each denoising step.
-            Uses the same Python scalar arithmetic as the historical loop.
+        precompute_times: Retained for caller compatibility. Timestep values are now always
+            precomputed once. Uniform values preserve historical Python float arithmetic in a
+            float64 schedule; model inputs remain float32. Explicit grids retain their dtype.
     """
     bsize = noise.shape[0]
     device = noise.device
@@ -347,25 +347,23 @@ def euler_integrate(
     def uniform_time(step: int) -> float:
         return (1.0 + step * uniform_dt) if noise_at_one else step * uniform_dt
 
-    times = (
-        torch.tensor([uniform_time(step) for step in range(num_steps)], dtype=torch.float32, device=device)
-        if precompute_times and time_grid is None
-        else None
+    schedule_device = torch.device("cpu") if device.type == "mps" else device
+    schedule = (
+        torch.tensor(
+            [uniform_time(step) for step in range(num_steps)],
+            dtype=torch.float64,
+            device=schedule_device,
+        )
+        if time_grid is None
+        else time_grid.to(device=schedule_device)
     )
+    needs_rtc_time = rtc_enabled or (rtc_processor is not None and rtc_processor.is_debug_enabled())
     x_t = noise
     for step in range(num_steps):
-        if time_grid is None:
-            dt = uniform_dt
-            time_tensor = (
-                times[step].expand(bsize)
-                if times is not None
-                else torch.full((bsize,), uniform_time(step), dtype=torch.float32, device=device)
-            )
-        else:
-            # Slice the grid rather than reading it back: `float(time_grid[step])` would
-            # synchronise with the accelerator once per step.
-            dt = time_grid[step + 1] - time_grid[step]
-            time_tensor = time_grid[step].to(dtype=torch.float32, device=device).expand(bsize)
+        time_scalar = schedule[step]
+        # Uniform subtraction is not bit-identical to the historical constant dt.
+        dt = uniform_dt if time_grid is None else schedule[step + 1] - time_scalar
+        time_tensor = time_scalar.to(dtype=torch.float32, device=device).expand(bsize)
 
         if hard_prefix is not None:
             if hard_prefix_mask is None:
@@ -384,12 +382,10 @@ def euler_integrate(
         ) -> Tensor:
             return -velocity(input_x_t, current_timestep, current_step)
 
-        needs_rtc_time = rtc_enabled or (rtc_processor is not None and rtc_processor.is_debug_enabled())
         if needs_rtc_time:
-            # RTCProcessor takes a plain float in the NOISE_AT_ONE convention. On the explicit-grid
-            # path this is the one place the schedule has to come back to the host.
-            host_time = uniform_time(step) if time_grid is None else float(time_grid[step])
-            rtc_time = host_time if noise_at_one else 1.0 - host_time
+            rtc_time = time_scalar.to(dtype=torch.float64)
+            if not noise_at_one:
+                rtc_time = 1.0 - rtc_time
 
         if guidance is not None:
             v_t = guidance.denoise_step(

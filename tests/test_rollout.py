@@ -230,6 +230,65 @@ def test_rollout_config_rejects_a_multiplier_below_one(multiplier):
         RolloutConfig(robot=MockRobotConfig(), interpolation_multiplier=multiplier)
 
 
+def test_rollout_compilation_flags_parse_from_yaml(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import draccus
+
+    from lerobot.policies.act.configuration_act import ACTConfig  # noqa: F401
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobotConfig  # noqa: F401
+
+    path = tmp_path / "inference.yaml"
+    path.write_text(
+        "robot:\n  type: mock_robot\n"
+        "policy:\n  type: act\n  device: cpu\n"
+        "device: cpu\n"
+        "use_torch_compile: true\n"
+    )
+    monkeypatch.setattr(sys, "argv", ["lerobot-rollout"])
+
+    cfg = draccus.parse(RolloutConfig, config_path=str(path), args=[])
+
+    assert cfg.use_torch_compile is True
+
+
+@pytest.mark.parametrize("policy_type", ["act", "pi05"])
+def test_rollout_applies_compile_options_before_policy_load(
+    monkeypatch: pytest.MonkeyPatch, policy_type: str
+) -> None:
+    import lerobot.rollout.context as rollout_context
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config_type = PI05Config if policy_type == "pi05" else ACTConfig
+    cfg = RolloutConfig(
+        robot=MockRobotConfig(),
+        policy=config_type(device="cpu", pretrained_path=Path("unused-checkpoint")),
+        device="cpu",
+        use_torch_compile=True,
+        torch_compile_mode="default",
+    )
+    stop_loading = RuntimeError("stop before policy construction and hardware")
+
+    def load_policy(config: ACTConfig | PI05Config) -> None:
+        if policy_type == "pi05":
+            assert isinstance(config, PI05Config)
+            assert config.compile_model is True
+            assert config.compile_mode == "default"
+        raise stop_loading
+
+    hardware = MagicMock()
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", load_policy)
+    monkeypatch.setattr(rollout_context, "_connect_rollout_hardware", hardware)
+
+    with pytest.raises(RuntimeError) as raised:
+        rollout_context.build_rollout_context(cfg, threading.Event())
+
+    assert raised.value is stop_loading
+    hardware.assert_not_called()
+
+
 def test_build_rollout_context_rejects_missing_policy() -> None:
     from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.rollout import RolloutConfig, build_rollout_context

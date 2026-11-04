@@ -463,6 +463,8 @@ def build_rollout_context(
 
     if hasattr(policy_config, "compile_model"):
         policy_config.compile_model = cfg.use_torch_compile
+        if cfg.use_torch_compile and hasattr(policy_config, "compile_mode"):
+            policy_config.compile_mode = cfg.torch_compile_mode
 
     if policy_config.type == "vqbet" and cfg.device == "mps":
         raise NotImplementedError(

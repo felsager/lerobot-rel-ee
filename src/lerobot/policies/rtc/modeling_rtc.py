@@ -156,8 +156,9 @@ class RTCProcessor:
               right-padded with zeros to match ``T``.
             - Prefix weights are constructed via ``get_prefix_weights(inference_delay, execution_horizon, T)``
               and broadcast to ``(B, T, A)``.
-            - Guidance correction is computed via autograd using ``x1_t = x_t + time * v_t`` and
-              ``error = (prev_chunk_left_over - x1_t) * weights``.
+            - With noise at time one, the clean estimate is ``x1_t = x_t - time * v_t``.
+              The correction is the weighted error, treating ``d x1_t / d x_t`` as the identity,
+              so the denoiser is never differentiated.
             - The final guidance weight is clamped by ``max_guidance_weight`` from the config.
 
         Reference:
@@ -213,21 +214,23 @@ class RTCProcessor:
             .unsqueeze(-1)
         )
 
-        with torch.enable_grad():
-            v_t = original_denoise_step_partial(x_t)
-            x_t.requires_grad_(True)
+        v_t = original_denoise_step_partial(x_t)
 
-            x1_t = x_t - time * v_t  # noqa: N806
-            err = (prev_chunk_left_over - x1_t) * weights
-            grad_outputs = err.clone().detach()
-            correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+        x1_t = x_t - time * v_t  # noqa: N806
+        err = (prev_chunk_left_over - x1_t) * weights
+        # Deliberately J = I, not the reference's full d(x1_t)/d(x_t). On a real UR5e the full
+        # VJP left handoff gaps near the unguided level and nearly doubled inference time.
+        correction = err
 
-        max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
-        tau_tensor = torch.as_tensor(tau)
+        # Historically tau was computed as a Python float, then rounded to the
+        # default tensor dtype. Preserve that boundary for float64 RTC times;
+        # evaluating the complement in float32 first changes guidance weights.
+        tau_tensor = torch.as_tensor(tau, dtype=torch.get_default_dtype(), device=x_t.device)
+        max_guidance_weight = tau_tensor.new_tensor(self.rtc_config.max_guidance_weight)
         squared_one_minus_tau = (1 - tau_tensor) ** 2
         inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
-        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
-        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=self.rtc_config.max_guidance_weight)
+        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=self.rtc_config.max_guidance_weight)
         guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
 
         result = v_t - guidance_weight * correction

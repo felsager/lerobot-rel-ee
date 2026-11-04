@@ -1272,3 +1272,94 @@ def test_make_inputs_rejects_shapes_that_would_broadcast_silently():
             convention=FlowConvention.NOISE_AT_ONE,
             prefix_mask=torch.zeros(2, 4, 3, dtype=torch.bool),
         )
+
+
+@pytest.mark.parametrize("precompute_times", [False, True])
+@pytest.mark.parametrize("convention", list(FlowConvention))
+@pytest.mark.parametrize("explicit_grid", [False, True])
+def test_unified_schedule_supplies_scalar_rtc_times_and_float32_model_times(
+    precompute_times, convention, explicit_grid
+):
+    """RTC sees one double scalar, never a batch vector or host-read grid value."""
+    processor = _StubRTCProcessor(False)
+    model_times = []
+    grid = torch.tensor([0.0, 0.13, 0.41, 1.0], dtype=torch.float32)
+    if convention is FlowConvention.NOISE_AT_ONE:
+        grid = grid.flip(0)
+    if explicit_grid:
+        grid = grid.as_subclass(_NoHostReadGrid)
+
+    def denoise(value, time):
+        model_times.append(time)
+        assert time.dtype == torch.float32
+        assert time.shape == (3,)
+        return torch.ones_like(value)
+
+    euler_integrate(
+        denoise,
+        torch.zeros(3, 6, 4),
+        3 if explicit_grid else 10,
+        convention=convention,
+        time_grid=grid if explicit_grid else None,
+        rtc_processor=processor,
+        rtc_enabled=True,
+        precompute_times=precompute_times,
+    )
+    times = [call["time"] for call in processor.guidance_calls]
+    assert all(time.ndim == 0 and time.dtype == torch.float64 for time in times)
+    if explicit_grid:
+        expected = grid[:-1].as_subclass(torch.Tensor).to(torch.float64)
+    else:
+        dt = (-1.0 if convention is FlowConvention.NOISE_AT_ONE else 1.0) / 10
+        expected = torch.tensor(
+            [
+                1.0 + step * dt if convention is FlowConvention.NOISE_AT_ONE else step * dt
+                for step in range(10)
+            ],
+            dtype=torch.float64,
+        )
+    model_expected = expected.to(torch.float32)
+    if convention is FlowConvention.NOISE_AT_ZERO:
+        expected = 1.0 - expected
+    actual = torch.stack(times).as_subclass(torch.Tensor)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual_model = torch.stack(model_times)[:, 0].as_subclass(torch.Tensor)
+    torch.testing.assert_close(actual_model, model_expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+        ),
+    ],
+)
+@pytest.mark.parametrize("num_steps", [7, 10])
+@pytest.mark.parametrize("precompute_times", [False, True])
+def test_uniform_tensor_schedule_preserves_historical_guided_sampler(
+    device, num_steps, precompute_times
+):
+    """Tensor times preserve complete guided outputs against Python-float times."""
+    torch.manual_seed(71)
+    noise = torch.randn(2, 6, 4, device=device)
+    previous = torch.randn_like(noise)
+    matrix = torch.randn(4, 4, device=device) * 0.1
+
+    def velocity(value, time):
+        return torch.tanh(value @ matrix + time[:, None, None])
+
+    kwargs = {"inference_delay": 1, "execution_horizon": 4, "prev_chunk_left_over": previous}
+    reference = _reference_pi0_loop(velocity, noise, num_steps, True, _make_rtc_processor(), kwargs)
+    actual = euler_integrate(
+        velocity,
+        noise,
+        num_steps,
+        rtc_processor=_make_rtc_processor(),
+        rtc_enabled=True,
+        precompute_times=precompute_times,
+        **kwargs,
+    )
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    assert not actual.requires_grad
