@@ -33,14 +33,18 @@ from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    AbsoluteEEActionsStep,
     ActionTokenizerProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
+    EEStateStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
+    RelativeEEActionsStep,
     RenameObservationsProcessorStep,
+    TokenizerProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
@@ -58,7 +62,7 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import _transformers_available
 
-from ..pi05.processor_pi05 import make_pi05_pre_post_processors
+from ..pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep, make_pi05_pre_post_processors
 from .configuration_fineart_vla import FineARTVLAConfig
 from .fit_fast_tokenizer import resolve_fast_tokenizer
 
@@ -280,6 +284,9 @@ class FineARTVLATextTokenizerStep(ProcessorStep):
     max_length: int = 200
     padding: str = "max_length"
     padding_side: str = "right"
+    include_state_in_prompt: bool = True
+    prompt_control_prefix: bool = False
+    use_relative_ee: bool = False
 
     def __post_init__(self) -> None:
         self._tokenizer: Any = None
@@ -290,6 +297,9 @@ class FineARTVLATextTokenizerStep(ProcessorStep):
             "max_length": self.max_length,
             "padding": self.padding,
             "padding_side": self.padding_side,
+            "include_state_in_prompt": self.include_state_in_prompt,
+            "prompt_control_prefix": self.prompt_control_prefix,
+            "use_relative_ee": self.use_relative_ee,
         }
 
     def _ensure_tokenizer(self) -> Any:
@@ -373,12 +383,22 @@ class FineARTVLATextTokenizerStep(ProcessorStep):
 
         messages = [_strip_blocks(_flatten_say_tool_calls(m)) for m in messages]
         # Only low-level prompts carry PI0.5-style proprioception.
-        if state_row is not None and any(s == "low_level" for s in message_streams):
-            state_str = discretize_state_str(state_row)
+        if any(s == "low_level" for s in message_streams):
             for m in reversed(messages):
                 if m.get("role") == "user":
                     base = _content_to_text(m.get("content", ""))
-                    m["content"] = f"{base}, State: {state_str};"
+                    if self.prompt_control_prefix:
+                        mode = "end effector cam frame" if self.use_relative_ee else "end effector"
+                        prefix = f"<control mode> {mode} </control mode> "
+                        if not base.startswith(prefix):
+                            if base.startswith("<control mode>"):
+                                raise ValueError(
+                                    "Task control-mode tag conflicts with policy.prompt_control_prefix"
+                                )
+                            base = prefix + base
+                    if self.include_state_in_prompt and state_row is not None:
+                        base = f"{base}, State: {discretize_state_str(state_row)};"
+                    m["content"] = base
                     break
         prompt, spans = _format_messages(messages, target_indices, getattr(tokenizer, "eos_token", None))
         if "message_streams" not in complementary and not message_streams and not target_indices:
@@ -439,7 +459,7 @@ def make_fineart_vla_pre_post_processors(
 ]:
     """Build FineART-VLA's pre/post-processor pipelines.
 
-    Falls through to π0.5's stock pipeline when ``recipe_path`` is unset. ``dataset_meta``
+    Falls through to π0.5's stock pipeline when ``recipe`` is None and FAST is off. ``dataset_meta``
     (forwarded by the policy factory) supplies the dataset source for FAST tokenizer fitting.
     """
     # ``make_policy`` attaches the training dataset's metadata to the config.
@@ -448,7 +468,7 @@ def make_fineart_vla_pre_post_processors(
         dataset_repo_id = dataset_repo_id or getattr(dataset_meta, "repo_id", None)
         dataset_root = dataset_root or getattr(dataset_meta, "root", None)
         dataset_revision = dataset_revision or getattr(dataset_meta, "revision", None)
-    if config.recipe is None:
+    if config.recipe is None and not config.use_pi05_action_prompt:
         if getattr(config, "enable_fast_action_loss", False):
             raise ValueError("FineART-VLA FAST action loss requires recipe_path to build action supervision.")
         return make_pi05_pre_post_processors(config, dataset_stats=dataset_stats)
@@ -456,32 +476,63 @@ def make_fineart_vla_pre_post_processors(
     if config.input_features is None or config.output_features is None or config.device is None:
         raise ValueError("FineART-VLA processors require input/output features and a device")
 
-    from lerobot.datasets.recipe import TrainingRecipe  # recipes need the dataset extras
-
-    recipe = TrainingRecipe.from_dict(config.recipe)
-
     relative_step = RelativeActionsProcessorStep(
         enabled=config.use_relative_actions,
         exclude_joints=getattr(config, "relative_exclude_joints", []),
         action_names=getattr(config, "action_feature_names", None),
     )
+    relative_ee_step = RelativeEEActionsStep(
+        enabled=config.use_relative_ee,
+        state_frame=-1,
+        rot_repr=config.rotation_representation,
+    )
 
-    input_steps = [
+    input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         relative_step,
+        relative_ee_step,
+        EEStateStep(enabled=config.use_relative_ee, rot_repr=config.rotation_representation),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        RenderRuntimeMessagesStep(recipe=recipe),
-        RenderTrainingMessagesStep(recipe=recipe),
-        FineARTVLATextTokenizerStep(
-            tokenizer_name=config.text_tokenizer_name,
-            max_length=config.tokenizer_max_length,
-        ),
     ]
+    if config.use_pi05_action_prompt:
+        input_steps.extend(
+            [
+                Pi05PrepareStateTokenizerProcessorStep(
+                    max_state_dim=config.max_state_dim,
+                    prompt_control_prefix=config.prompt_control_prefix,
+                    use_relative_ee=config.use_relative_ee,
+                    include_state_in_prompt=config.use_proprio and not config.use_proprioceptive_memory,
+                ),
+                TokenizerProcessorStep(
+                    tokenizer_name=config.text_tokenizer_name,
+                    max_length=config.tokenizer_max_length,
+                    padding_side="right",
+                    padding="max_length",
+                ),
+            ]
+        )
+    else:
+        from lerobot.datasets.recipe import TrainingRecipe  # recipes need the dataset extras
+
+        recipe = TrainingRecipe.from_dict(config.recipe)
+        input_steps.extend(
+            [
+                RenderRuntimeMessagesStep(recipe=recipe),
+                RenderTrainingMessagesStep(recipe=recipe),
+                FineARTVLATextTokenizerStep(
+                    tokenizer_name=config.text_tokenizer_name,
+                    max_length=config.tokenizer_max_length,
+                    include_state_in_prompt=config.use_proprio and not config.use_proprioceptive_memory,
+                    prompt_control_prefix=config.prompt_control_prefix,
+                    use_relative_ee=config.use_relative_ee,
+                ),
+            ]
+        )
 
     # Add FAST action-token supervision only when explicitly enabled.
     if getattr(config, "enable_fast_action_loss", False):
@@ -505,7 +556,7 @@ def make_fineart_vla_pre_post_processors(
 
     input_steps.append(DeviceProcessorStep(device=config.device))
 
-    output_steps = [
+    output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
             features=config.output_features,
             norm_map=config.normalization_mapping,
@@ -515,6 +566,7 @@ def make_fineart_vla_pre_post_processors(
             enabled=config.use_relative_actions,
             relative_step=relative_step,
         ),
+        AbsoluteEEActionsStep(enabled=config.use_relative_ee, relative_step=relative_ee_step),
         DeviceProcessorStep(device="cpu"),
     ]
     return (

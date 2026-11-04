@@ -146,6 +146,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
         preprocessor_overrides: A dictionary of overrides for the preprocessor configuration.
         postprocessor_overrides: A dictionary of overrides for the postprocessor configuration.
         dataset_stats: Dataset statistics for normalization.
+        dataset_episodes: Selected training episode IDs for dataset-fitted processors.
     """
 
     preprocessor_config_filename: str | None
@@ -154,6 +155,7 @@ class ProcessorConfigKwargs(TypedDict, total=False):
     postprocessor_overrides: dict[str, Any] | None
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None
     dataset_meta: Any | None
+    dataset_episodes: list[int] | None
 
 
 def make_pre_post_processors(
@@ -222,6 +224,7 @@ def make_pre_post_processors(
         config=policy_cfg,
         dataset_stats=kwargs.get("dataset_stats"),
         dataset_meta=kwargs.get("dataset_meta"),
+        dataset_episodes=kwargs.get("dataset_episodes"),
     )
 
 
@@ -527,6 +530,7 @@ def _make_processors_from_policy_config(
     config: PreTrainedConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
     dataset_meta: Any | None = None,
+    dataset_episodes: list[int] | None = None,
 ) -> tuple[Any, Any]:
     """Create pre- and post-processors from a policy configuration using dynamic imports.
 
@@ -538,6 +542,7 @@ def _make_processors_from_policy_config(
         dataset_stats: Dataset statistics for normalization.
         dataset_meta: Dataset metadata, forwarded only to factories that declare a
             ``dataset_meta`` parameter (e.g. groot, molmoact2).
+        dataset_episodes: Training episode IDs, forwarded to factories accepting ``episodes``.
     Returns:
         A tuple containing the input (pre-processor) and output (post-processor) pipelines.
     """
@@ -552,6 +557,9 @@ def _make_processors_from_policy_config(
     if function is None:
         raise ValueError(f"Processor for policy type '{policy_type}' is not implemented.")
     call_kwargs: dict[str, Any] = {"dataset_stats": dataset_stats}
-    if "dataset_meta" in inspect.signature(function).parameters:
+    parameters = inspect.signature(function).parameters
+    if "dataset_meta" in parameters:
         call_kwargs["dataset_meta"] = dataset_meta
+    if "episodes" in parameters:
+        call_kwargs["episodes"] = dataset_episodes
     return function(config, **call_kwargs)

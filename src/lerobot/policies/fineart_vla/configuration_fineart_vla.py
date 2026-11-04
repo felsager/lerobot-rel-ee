@@ -67,6 +67,9 @@ class FineARTVLAConfig(PI05Config):
     recipe: dict | None = field(default_factory=_fineart_vla_default_recipe)
     """Serialized training/runtime contract; ``None`` selects the plain PI0.5 prompt."""
 
+    use_pi05_action_prompt: bool = False
+    """Use PI0.5's task/state prompt with optional FAST supervision, without recipe language generation."""
+
     memory_scratchpad: bool = False
     """Legacy checkpoint guard: combined responses require a scratchpad-aware controller."""
 
@@ -182,7 +185,9 @@ class FineARTVLAConfig(PI05Config):
             # The resolved recipe is now part of the config: later loads must not re-read a file
             # that may have changed since, so the saved checkpoint keeps the recipe it trained with.
             self.recipe_path = None
-        if self.enable_fast_action_loss and self.recipe is None:
+        if self.use_pi05_action_prompt and self.text_loss_weight != 0:
+            raise ValueError("use_pi05_action_prompt requires text_loss_weight=0 (action-only training).")
+        if self.enable_fast_action_loss and self.recipe is None and not self.use_pi05_action_prompt:
             raise ValueError("FineART-VLA FAST action loss requires recipe_path to build action supervision.")
         # Text and FAST cross-entropy supervise the VLM itself (knowledge insulation only keeps the
         # flow loss out of it), so they need a trainable backbone.

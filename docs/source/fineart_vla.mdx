@@ -25,6 +25,47 @@ FineART-VLA can initialize from a Pi05 checkpoint. The policy architecture remai
 compatible, while FineART-VLA builds its own processors so recipe labels and FAST
 labels are not silently replaced by the Pi05 processor stack.
 
+### Relative-EE action-only training
+
+`policy.use_pi05_action_prompt=true` preserves PI0.5's `Task: ...;\nAction: `
+prompt while allowing FAST auxiliary supervision. Set `policy.text_loss_weight=0`
+and `policy.recipe=null` for this action-only path; subtask annotations are not
+required. The normal FineART language-recipe path remains the default.
+
+Both processor paths honor `use_relative_ee`, `rotation_representation`,
+`use_proprio`, and `prompt_control_prefix`. With `use_proprio=false`, state is
+omitted from the language prompt but remains available to anchor relative EE
+actions. Absolute `[xyz, qx, qy, qz, qw, gripper]` dataset targets are transformed
+into the current EE frame before normalization. Output actions are unnormalized
+and reconstructed using that same raw-state anchor, including after processor
+save/load. `rot6d_identity_norm=true` uses the shared relative-EE statistics path
+to leave the six rotation coordinates unchanged by normalization.
+
+FAST fitting applies the same EE transform and action statistics as training.
+It uses the selected training episodes (including held-out episode exclusions),
+and its cache distinguishes action representations and normalization statistics.
+
+The repository's `examples/training/fineart_rel_ee.yaml`
+adapts the working cube-training recipe: 30k updates, effective batch 16,
+`5e-5` learning rate decaying to `5e-6`, no warmup, unfrozen vision, relative EE,
+identity rot6d normalization, and no proprioceptive prompt. It starts from
+`lerobot/pi05_base`, keeps the flow weight and repeat count at 1, and adds FAST
+with an experimental weight of 0.1 and knowledge insulation off. Compare
+`knowledge_insulation=true` in a separate run. Trained RTC and observation memory
+are not added by this adaptation.
+
+```bash
+uv run lerobot-train \
+    --config_path=examples/training/fineart_rel_ee.yaml \
+    --dataset.episodes="[$(seq -s, 0 999)]" \
+    --output_dir=outputs/train/fineart_rel_ee
+```
+
+With `torchrun`, divide the configured batch size by the number of processes to
+preserve effective batch 16. Do not add `--policy.path=lerobot/pi05_base`: it
+selects the checkpoint's PI05 policy type. The example instead selects
+`type: fineart_vla` and loads the PI05 weights with `pretrained_path`.
+
 ## Install
 
 Install LeRobot with the FineART-VLA dependencies:

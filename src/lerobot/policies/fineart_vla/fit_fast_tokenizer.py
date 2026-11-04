@@ -29,9 +29,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch
 from huggingface_hub import snapshot_download
 
+from lerobot.processor.relative_ee_action_processor import to_relative_ee_actions
 from lerobot.utils.import_utils import _datasets_available, _transformers_available, require_package
+from lerobot.utils.rotation_representations import RotationRepresentation
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoProcessor
@@ -78,6 +81,8 @@ def _dataset_signature(
     validation_samples: int = 256,
     max_reconstruction_rmse: float = 0.10,
     max_dim_rmse: float = 0.20,
+    use_relative_ee: bool = False,
+    rotation_representation: RotationRepresentation = RotationRepresentation.rot6d,
 ) -> str:
     """Hash every input that changes the fitted action distribution."""
     payload = {
@@ -95,6 +100,8 @@ def _dataset_signature(
         "validation_samples": validation_samples,
         "max_reconstruction_rmse": max_reconstruction_rmse,
         "max_dim_rmse": max_dim_rmse,
+        "use_relative_ee": use_relative_ee,
+        "rotation_representation": rotation_representation,
     }
     encoded = json.dumps(_jsonable(payload), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -238,6 +245,8 @@ def fit_fast_tokenizer(
     validation_samples: int = 256,
     max_reconstruction_rmse: float = 0.10,
     max_dim_rmse: float = 0.20,
+    use_relative_ee: bool = False,
+    rotation_representation: RotationRepresentation = RotationRepresentation.rot6d,
 ) -> str:
     """Fit a FAST tokenizer on a LeRobot dataset's action distribution.
 
@@ -268,6 +277,8 @@ def fit_fast_tokenizer(
             update to the current published model).
         FileNotFoundError: If the dataset can't be loaded.
     """
+    if use_relative_ee and use_relative_actions:
+        raise ValueError("Relative EE mode cannot be combined with joint-relative actions.")
     cache_dir = Path(cache_dir)
     normalization_mode = getattr(normalization_mode, "value", normalization_mode).upper()
     sig = _dataset_signature(
@@ -285,6 +296,8 @@ def fit_fast_tokenizer(
         validation_samples,
         max_reconstruction_rmse,
         max_dim_rmse,
+        use_relative_ee,
+        rotation_representation,
     )
     out_dir = cache_dir / sig
 
@@ -341,7 +354,7 @@ def fit_fast_tokenizer(
         raise RuntimeError(f"FAST fit: no ``data/chunk-*/file-*.parquet`` shards found under {snap!s}.")
 
     columns = ["episode_index", "action"]
-    if use_relative_actions:
+    if use_relative_actions or use_relative_ee:
         columns.append("observation.state")
     tables = [pq.read_table(f, columns=columns) for f in data_files]
     table = pa.concat_tables(tables)
@@ -356,7 +369,7 @@ def fit_fast_tokenizer(
     if acts.ndim != 2:
         raise RuntimeError(f"FAST fit: expected ``action`` rows to be 1-D vectors; got shape {acts.shape}.")
     states = None
-    if use_relative_actions:
+    if use_relative_actions or use_relative_ee:
         try:
             states = np.stack(table["observation.state"].to_numpy(zero_copy_only=False)).astype(np.float32)
         except Exception:  # noqa: BLE001
@@ -420,7 +433,13 @@ def fit_fast_tokenizer(
 
     actions = np.stack(actions_buf, axis=0).astype(np.float32)  # (N, H, D)
     if states is not None:
-        actions = _apply_relative_actions(actions, np.stack(states_buf), relative_action_mask)
+        reference_states = np.stack(states_buf)
+        if use_relative_ee:
+            actions = to_relative_ee_actions(
+                torch.from_numpy(actions), torch.from_numpy(reference_states), rotation_representation
+            ).numpy()
+        else:
+            actions = _apply_relative_actions(actions, reference_states, relative_action_mask)
     logger.info(
         "FAST fit: collected %d chunks of shape %s from %d episodes",
         actions.shape[0],
@@ -517,6 +536,8 @@ def resolve_fast_tokenizer(
         "action_stats": (dataset_stats or {}).get("action"),
         "use_relative_actions": getattr(config, "use_relative_actions", False),
         "relative_action_mask": relative_action_mask,
+        "use_relative_ee": getattr(config, "use_relative_ee", False),
+        "rotation_representation": getattr(config, "rotation_representation", RotationRepresentation.rot6d),
     }
     validation_fields = {
         "validation_samples": "fast_tokenizer_validation_samples",

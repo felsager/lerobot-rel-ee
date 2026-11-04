@@ -1,0 +1,65 @@
+# Action-only FAST experiment based on the working pi05 cube recipe.
+# Select the first 1000 episodes at launch (the source dataset is not modified):
+# uv run lerobot-train --config_path=examples/training/fineart_rel_ee.yaml \
+#   --dataset.episodes="[$(seq -s, 0 999)]" --output_dir=outputs/train/fineart_rel_ee
+# For multiple GPUs, divide batch_size=16 by the number of processes.
+dataset:
+  repo_id: felsager/vla_cubes_cross_dr
+  video_backend: torchcodec
+  return_uint8: true
+
+seed: 0
+batch_size: 16
+steps: 30000
+num_workers: 8
+prefetch_factor: 1
+save_checkpoint: true
+save_checkpoint_to_hub: true
+save_freq: -1
+log_freq: 250
+wandb:
+  enable: true
+  disable_artifact: true
+accelerator:
+  mixed_precision: bf16
+
+policy:
+  type: fineart_vla
+  pretrained_path: lerobot/pi05_base
+  repo_id: felsager/fineart_cube2cross
+  input_features: null
+  output_features: null
+  device: cuda
+  dtype: bfloat16
+  use_relative_ee: true
+  use_relative_actions: false
+  rotation_representation: rot6d
+  rot6d_identity_norm: true
+  use_proprio: false
+  use_proprioceptive_memory: false
+  prompt_control_prefix: false
+  chunk_size: 50
+  n_action_steps: 50
+  num_inference_steps: 10
+  freeze_vision_encoder: false
+  train_expert_only: false
+  optimizer_lr: 5e-5
+  optimizer_grad_clip_norm: 1.0
+  optimizer_weight_decay: 0.01
+  scheduler_decay_lr: 5e-6
+  scheduler_decay_steps: 30000
+  scheduler_warmup_steps: 0
+  gradient_checkpointing: true
+  optimizer_fused: true
+  compile_model: true
+  compile_mode: default
+
+  # Preserve PI0.5's prompt and flow objective; add only FAST initially.
+  use_pi05_action_prompt: true
+  recipe: null
+  text_loss_weight: 0.0
+  flow_loss_weight: 1.0
+  flow_num_repeats: 1
+  enable_fast_action_loss: true
+  fast_action_loss_weight: 0.1  # Experimental starting weight, not a measured optimum.
+  knowledge_insulation: false  # Compare with true in a separate run.

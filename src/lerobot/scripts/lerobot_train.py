@@ -664,14 +664,17 @@ def train(cfg: TrainPipelineConfig) -> None:
 
     # --- processors (overrides built once, as one typed mapping) -------------------------------
     processor_pretrained_path = resume_pretrained_dir or active_cfg.pretrained_path
-    if not cfg.resume and getattr(active_cfg, "recipe", None) is not None:
+    if not cfg.resume and (
+        getattr(active_cfg, "recipe", None) is not None
+        or getattr(active_cfg, "use_pi05_action_prompt", False)
+    ):
         if processor_pretrained_path is not None and is_main_process():
             logging.warning(
-                "Language recipe fine-tuning rebuilds processors from the active configuration; "
+                "Prompt fine-tuning rebuilds processors from the active configuration; "
                 "saved processors from %s will not be loaded.",
                 processor_pretrained_path,
             )
-        # Language fine-tuning must use the active recipe, not the saved processor recipe.
+        # Fine-tuning must use the active prompt/FAST settings, not the base model's processors.
         processor_pretrained_path = None
 
     if not cfg.resume and getattr(active_cfg, "use_relative_ee", False):
@@ -679,6 +682,8 @@ def train(cfg: TrainPipelineConfig) -> None:
         processor_pretrained_path = None
 
     processor_kwargs = ProcessorConfigKwargs()
+    # FAST fitting must use the actual training split, including episode exclusions.
+    processor_kwargs["dataset_episodes"] = dataset.episodes
     processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = processor_dataset_stats
