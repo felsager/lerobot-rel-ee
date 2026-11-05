@@ -109,8 +109,8 @@ def resolve_delta_timestamps(
 
 
 def _validate_relative_ee_dataset(cfg: TrainPipelineConfig, ds_meta: LeRobotDatasetMetadata) -> None:
-    if cfg.trainable_config.type not in {"act", "smolvla", "pi05"}:
-        raise ValueError("Relative EE training is supported for ACT, SmolVLA, and π0.5")
+    if cfg.trainable_config.type not in {"act", "smolvla", "pi05", "fineart_vla"}:
+        raise ValueError("Relative EE training is supported for ACT, SmolVLA, π0.5, and FineART-VLA")
     if cfg.dataset.streaming:
         raise ValueError("Relative EE statistics require a non-streaming dataset")
     action_feature = ds_meta.features.get(ACTION)
