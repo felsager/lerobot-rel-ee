@@ -47,6 +47,7 @@ from .streaming_sidecar import (
     ensure_dataset_mp4_sidecar,
     streaming_data_root,
 )
+from .task_paraphrases import TaskParaphrases
 from .utils import (
     check_version_compatibility,
     delta_window,
@@ -200,6 +201,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
                 break
         ```
     """
+
+    # Applied in yield order, outside parallel sample decoding.
+    task_paraphrases: TaskParaphrases | None = None
 
     # Set in __init__; class defaults keep partially built instances (tests) on the one-worker path.
     _worker_pool_size: int | None = None
@@ -663,6 +667,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
                 item = decoded_futures.popleft().result()
                 if transform_on_consumer:
                     self._apply_image_transforms(item)
+                if self.task_paraphrases is not None:
+                    item["task"] = self.task_paraphrases(item["task"])
                 self._state_offset += 1
                 yield item
             self._active_epoch = epoch + 1 if self.shuffle else 0

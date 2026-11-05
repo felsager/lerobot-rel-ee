@@ -39,6 +39,7 @@ from .storage import (
     localize_remote_root,
     make_dataset_reader,
 )
+from .task_paraphrases import TaskParaphrases
 from .utils import (
     create_lerobot_dataset_card,
     get_safe_version,
@@ -50,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 
 class LeRobotDataset(torch.utils.data.Dataset):
+    # Training-only augmentation; recording and direct dataset reads default to canonical tasks.
+    task_paraphrases: TaskParaphrases | None = None
+
     def __init__(
         self,
         repo_id: str,
@@ -599,10 +603,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if isinstance(idx, slice):
             return [self[item_idx] for item_idx in range(*idx.indices(len(self)))]
 
-        return self._ensure_reader().get_item(idx)
+        item = self._ensure_reader().get_item(idx)
+        if self.task_paraphrases is not None:
+            item["task"] = self.task_paraphrases(item["task"])
+        return item
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        return self._ensure_reader().get_items(list(indices))
+        items = self._ensure_reader().get_items(list(indices))
+        if self.task_paraphrases is not None:
+            for item in items:
+                item["task"] = self.task_paraphrases(item["task"])
+        return items
 
     def select_columns(self, column_names: str | list[str]):
         """Select specific columns from the underlying dataset.

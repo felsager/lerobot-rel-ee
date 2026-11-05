@@ -46,6 +46,8 @@ class DatasetConfig:
     exclude_episodes: list[int] | None = None
     image_transforms: ImageTransformsConfig = field(default_factory=ImageTransformsConfig)
     revision: str | None = None
+    # Sample training task text from meta/paraphrases.json in the selected dataset revision.
+    paraphrases: bool = False
     use_imagenet_stats: bool = True
     video_backend: str = field(default_factory=get_safe_default_video_backend)
     # When True, RGB video frames are returned as uint8 tensors (0-255) instead of float32 (0.0-1.0).

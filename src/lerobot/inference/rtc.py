@@ -21,7 +21,9 @@ import logging
 import math
 import time
 import traceback
+from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -47,7 +49,7 @@ from .contracts import (
     QueryKind,
 )
 from .execution import ChunkRuntime, HoldState
-from .prediction import chunk_inference_context, predict_chunk
+from .prediction import ChunkPrediction, chunk_inference_context, predict_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,15 @@ _RTC_IDLE_SLEEP_S: float = 0.01
 _RTC_MAX_CONSECUTIVE_DISCARDS: int = 5
 # Hard timeout for joining the RTC thread on stop().
 _RTC_JOIN_TIMEOUT_S: float = 3.0
+
+
+@dataclass
+class _CompilePreparation:
+    observation: dict[str, Any]
+    task: str
+    cancelled: Event = field(default_factory=Event)
+    done: Event = field(default_factory=Event)
+    error: BaseException | None = None
 
 
 class _TrainedRTCDelayExceededError(RuntimeError):
@@ -204,6 +215,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
         self._started = False
+        self._compile_preparation: _CompilePreparation | None = None
 
         if not self._use_torch_compile:
             self._compile_warmup_done.set()
@@ -280,6 +292,131 @@ class RTCInferenceEngine(InferenceEngine):
         """The shared action queue between the RTC thread and the main loop."""
         return self._runtime.queue
 
+    def prepare_compilation(
+        self, obs: dict, *, timeout_s: float, cancelled: Callable[[], bool] | None = None
+    ) -> None:
+        """Warm representative call shapes on the worker while execution stays paused.
+
+        The owned snapshot is for compilation only. Its predictions never enter the
+        runtime queue, and no synthetic fresh timestamp is assigned to old images.
+        Cancellation cannot interrupt a model call already inside the compiler.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("Compilation timeout must be finite and positive")
+        if self.failed:
+            raise RuntimeError(f"Inference failed: {self.failure_traceback}")
+        if self.ready:
+            return
+        if self._rtc_thread is None or not self._rtc_thread.is_alive():
+            raise RuntimeError("Start the inference worker before preparing compilation")
+        job = _CompilePreparation(deepcopy(obs), self.task)
+        with self._obs_lock:
+            if self._policy_active.is_set():
+                raise RuntimeError("Pause inference before preparing compilation")
+            if self._compile_preparation is not None:
+                raise RuntimeError("Compilation preparation is already running")
+            self._compile_preparation = job
+        deadline = time.monotonic() + timeout_s
+        while not job.done.wait(0.05):
+            if self._shutdown_event.is_set() or (cancelled is not None and cancelled()):
+                job.cancelled.set()
+                raise InterruptedError("Compilation preparation cancelled; no trial started")
+            if time.monotonic() >= deadline:
+                job.cancelled.set()
+                raise TimeoutError("Compilation preparation exceeded its startup timeout")
+            if self.failed:
+                raise RuntimeError(f"Inference failed: {self.failure_traceback}")
+        if job.error is not None:
+            raise RuntimeError("Compilation preparation failed") from job.error
+        if job.cancelled.is_set() or (cancelled is not None and cancelled()):
+            raise InterruptedError("Compilation preparation cancelled; no trial started")
+
+    def _prepare_compile_snapshot(self, job: _CompilePreparation) -> None:
+        """Run only on the inference worker; never activate or publish to runtime."""
+        previous = canonical_previous = None
+        completed = False
+        try:
+            frame = build_dataset_frame(self._obs_features, job.observation, prefix="observation")
+            for index in range(self._compile_warmup_inferences):
+                if job.cancelled.is_set() or self._shutdown_event.is_set():
+                    return
+                delay = 1 if index >= 2 and self._rtc_config.enabled else 0
+                if self._runtime.mode is ExecutionMode.RTC_TRAINED and delay:
+                    delay = min(self._policy_spec.training_max_delay, self._rtc_config.execution_horizon)
+                prediction = self._predict_observation(
+                    frame, job.task, self._runtime.mode, previous, canonical_previous, delay
+                )
+                if self._rtc_config.enabled:
+                    # The shared prediction helper normalizes prefixes to this horizon.
+                    horizon = self._rtc_config.execution_horizon
+                    previous = prediction.model_actions[-horizon:]
+                    canonical_previous = prediction.canonical_actions[-horizon:]
+                logger.info("Compilation warmup %d/%d complete", index + 1, self._compile_warmup_inferences)
+            if not job.cancelled.is_set() and not self._shutdown_event.is_set():
+                with self._runtime.lock:
+                    self._runtime.action_timeout = self._action_timeout_s
+                completed = True
+        except Exception as exc:
+            job.error = exc
+        finally:
+            try:
+                self._policy.reset()
+                self._preprocessor.reset()
+                self._postprocessor.reset()
+                self._language_preprocessor.reset()
+            except Exception as exc:
+                job.error = job.error or exc
+            if (
+                completed
+                and job.error is None
+                and not job.cancelled.is_set()
+                and not self._shutdown_event.is_set()
+            ):
+                self._compile_warmup_done.set()
+            else:
+                self._compile_warmup_done.clear()
+            with self._obs_lock:
+                self._compile_preparation = None
+            job.done.set()
+
+    def _predict_observation(
+        self,
+        features: dict[str, Any],
+        task: str,
+        mode: ExecutionMode,
+        previous: torch.Tensor | None,
+        canonical_previous: torch.Tensor | None,
+        delay: int,
+    ) -> ChunkPrediction:
+        policy_device = torch.device(self._device)
+        batch = prepare_observation_for_inference(
+            {key: value.copy() for key, value in features.items()},
+            policy_device,
+            task,
+            self._robot.robot_type,
+        )
+        batch["task"] = [task]
+        with chunk_inference_context(mode):
+            prediction = predict_chunk(
+                self._policy,
+                self._postprocessor,
+                self._preprocessor(batch),
+                spec=self._policy_spec,
+                mode=mode,
+                canonical_action_dim=self._canonical_action_dim,
+                model_action_dim=self._model_action_dim,
+                device=policy_device,
+                rtc_horizon=self._rtc_config.execution_horizon if self._rtc_config.enabled else 0,
+                inference_delay=delay,
+                model_continuation=previous,
+                canonical_continuation=canonical_previous,
+                relative_step=self._relative_step,
+                relative_ee_step=self._relative_ee_step,
+                normalizer_step=self._normalizer_step,
+            )
+            self._model_action_dim = prediction.model_actions.shape[1]
+            return prediction
+
     def start(self) -> None:
         """Launch the RTC background thread."""
         if self._started:
@@ -325,6 +462,8 @@ class RTCInferenceEngine(InferenceEngine):
         """Resume the RTC background thread."""
         logger.info("Resuming RTC inference thread")
         with self._obs_lock:
+            if self._compile_preparation is not None:
+                raise RuntimeError("Wait for compilation preparation before resuming inference")
             if self._runtime.activate(held=self._hold.requested):
                 self._policy_active.set()
 
@@ -520,7 +659,6 @@ class RTCInferenceEngine(InferenceEngine):
     def _rtc_loop(self) -> None:
         """Own all policy/processor mutations and use the shared chunk runtime."""
         try:
-            policy_device = torch.device(self._device)
             # Exercise both continuation branches and a nonzero delay before motion.
             # These representative graphs cannot cover every task/shape specialization.
             warmup_required = self._compile_warmup_inferences if self._use_torch_compile else 0
@@ -546,6 +684,13 @@ class RTCInferenceEngine(InferenceEngine):
                     self._preprocessor.reset()
                     self._postprocessor.reset()
                     self._language_preprocessor.reset()
+                with self._obs_lock:
+                    preparation = self._compile_preparation
+                if preparation is not None:
+                    self._prepare_compile_snapshot(preparation)
+                    if self.ready:
+                        inference_count = warmup_required
+                    continue
                 if not self._policy_active.is_set():
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
@@ -612,34 +757,10 @@ class RTCInferenceEngine(InferenceEngine):
                     delay = 0 if inference_count == 1 else 1
                     if self._runtime.mode is ExecutionMode.RTC_TRAINED and delay:
                         delay = min(self._policy_spec.training_max_delay, self._rtc_config.execution_horizon)
-                batch = prepare_observation_for_inference(
-                    {key: value.copy() for key, value in observation.features.items()},
-                    policy_device,
-                    task,
-                    self._robot.robot_type,
+                prediction = self._predict_observation(
+                    observation.features, task, request.mode, previous, canonical_previous, delay
                 )
-                batch["task"] = [task]
-                with chunk_inference_context(request.mode):
-                    preprocessed = self._preprocessor(batch)
-                    prediction = predict_chunk(
-                        self._policy,
-                        self._postprocessor,
-                        preprocessed,
-                        spec=self._policy_spec,
-                        mode=request.mode,
-                        canonical_action_dim=self._canonical_action_dim,
-                        model_action_dim=self._model_action_dim,
-                        device=policy_device,
-                        rtc_horizon=self._rtc_config.execution_horizon if self._rtc_config.enabled else 0,
-                        inference_delay=delay,
-                        model_continuation=previous,
-                        canonical_continuation=canonical_previous,
-                        relative_step=self._relative_step,
-                        relative_ee_step=self._relative_ee_step,
-                        normalizer_step=self._normalizer_step,
-                    )
-                    original, processed = prediction.model_actions, prediction.canonical_actions
-                    self._model_action_dim = original.shape[1]
+                original, processed = prediction.model_actions, prediction.canonical_actions
                 if inference_count < warmup_required:
                     # Warmup cannot leave motion or processor state for rollout.
                     with self._runtime.lock:

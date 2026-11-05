@@ -33,6 +33,7 @@ from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .storage import DEFAULT_STORAGE_FORMAT, is_bucket_root, load_dataset_metadata
 from .streaming_dataset import DEFAULT_STREAMING_SEED, StreamingLeRobotDataset
+from .task_paraphrases import TaskParaphrases
 from .utils import resolve_episode_indices
 
 logger = logging.getLogger(__name__)
@@ -273,6 +274,16 @@ def make_dataset(
     if use_relative_ee and not cfg.resume and not defer_relative_ee_stats:
         _prepare_relative_ee_stats(dataset, cfg.trainable_config.chunk_size, **_relative_ee_stats_kwargs(cfg))
 
+    if cfg.dataset.paraphrases:
+        path = dataset.meta.root / "meta" / "paraphrases.json"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"dataset.paraphrases=true requires meta/paraphrases.json in "
+                f"{dataset.repo_id!r} at revision {dataset.meta.revision!r} (looked in {path}). "
+                "Select a dataset revision containing the bank, or add it to the local dataset metadata."
+            )
+        dataset.task_paraphrases = TaskParaphrases(path)
+
     return dataset
 
 
@@ -372,4 +383,5 @@ def make_train_eval_datasets(
             eval_dataset, cfg.trainable_config.chunk_size, derived_stats, **_relative_ee_stats_kwargs(cfg)
         )
 
+    train_dataset.task_paraphrases = full_dataset.task_paraphrases
     return train_dataset, eval_dataset

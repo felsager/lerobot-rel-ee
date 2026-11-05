@@ -370,6 +370,17 @@ full-graph compilation can take several minutes; allow enough
 Warmup can compile additional first-chunk/prefixed variants, so a cached benchmark
 graph does not guarantee that every rollout variant is already cached.
 
+Operator-controlled extensions can call
+`RTCInferenceEngine.prepare_compilation(observation, timeout_s=..., cancelled=...)`
+after starting and pausing the engine. This runs representative warmup calls on the
+inference worker using an owned observation snapshot without activating execution,
+publishing actions, polling cameras, or altering live observation timestamps.
+The call returns after warmup and processor cleanup. Compilation errors, timeout,
+or cancellation do not grant readiness. Cancellation cannot interrupt an already
+running model call. The caller must keep robot motion suspended until preparation
+returns and a separate operator action starts the trial. Changes in task/shape or
+settings can still trigger later compilations.
+
 RTC compilation warms both initial and prefixed calls, including a representative
 nonzero delay, before motion. Although `--compile_warmup_inferences` defaults to 2,
 enabled RTC requires at least 3; startup logs report the effective count. Warmup must
