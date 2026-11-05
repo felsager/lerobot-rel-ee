@@ -15,15 +15,22 @@
 """Canonical EE input validation and conversion at the remote runner boundary."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from lerobot.configs import FeatureType, PolicyFeature
+from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, PolicyRunner
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.processor import AbsoluteEEActionsStep, EEStateStep, RelativeEEActionsStep
+from lerobot.processor import (
+    AbsoluteEEActionsStep,
+    EEStateStep,
+    NormalizerProcessorStep,
+    RelativeEEActionsStep,
+    UnnormalizerProcessorStep,
+)
 from lerobot.processor.factory import make_policy_processor_pipelines
 from lerobot.processor.relative_ee_action_processor import ee_to_rot_repr, to_absolute_ee_actions
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
@@ -44,7 +51,13 @@ class _EEPolicy(ConformingPolicy):
             torch.tensor([0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5]),
             self.config.rotation_representation,
         )
-        return action.expand(1, self.config.chunk_size, action.shape[-1]).clone()
+        actions = action.expand(1, self.config.chunk_size, action.shape[-1]).clone()
+        rtc_config = getattr(self.config, "rtc_config", None)
+        if rtc_config is not None and rtc_config.mode == "trained":
+            delay = kwargs.get("inference_delay", 0)
+            if delay:
+                actions[:, :delay] = kwargs["prev_chunk_left_over"][:delay]
+        return actions
 
 
 @pytest.fixture(
@@ -162,27 +175,112 @@ def test_runner_rejects_mismatched_state_and_action_rotation_representations(ee_
         PolicyRunner(policy, pre, post, **kwargs)
 
 
-def test_guided_rtc_reanchors_each_rotation_representation(ee_deployment):
+@pytest.mark.parametrize("mode", [ExecutionMode.RTC_GUIDED, ExecutionMode.RTC_TRAINED])
+@pytest.mark.parametrize("normalized", [False, True])
+@pytest.mark.parametrize("owner", ["runner", "local"])
+def test_rtc_reanchors_each_rotation_representation(ee_deployment, mode, normalized, owner):
     policy, pre, post, kwargs = ee_deployment
-    policy.config.rtc_config = RTCConfig(execution_horizon=4)
-    runner = PolicyRunner(policy, pre, post, modes=(ExecutionMode.RTC_GUIDED,), **kwargs)
+    policy.config.rtc_training_max_delay = 2
+    policy.config.rtc_config = RTCConfig(
+        mode="trained" if mode is ExecutionMode.RTC_TRAINED else "guided", execution_horizon=4
+    )
+    if normalized:
+        width = policy.config.output_features[ACTION].shape[0]
+        stats = {ACTION: {"mean": torch.linspace(-0.2, 0.2, width), "std": torch.linspace(0.5, 1.5, width)}}
+        normalization = {
+            "features": {ACTION: policy.config.output_features[ACTION]},
+            "norm_map": {FeatureType.ACTION: NormalizationMode.MEAN_STD},
+            "stats": stats,
+        }
+        pre.steps.append(NormalizerProcessorStep(**normalization))
+        post.steps.insert(0, UnnormalizerProcessorStep(**normalization))
+    if owner == "runner":
+        runner = PolicyRunner(policy, pre, post, modes=(mode,), **kwargs)
+
+        def predict(features, previous=None, canonical=None, delay=0):
+            return runner.predict(
+                ObservationSnapshot(features, 1.0, "pick"),
+                mode=mode,
+                inference_delay=delay,
+                model_continuation=previous,
+                canonical_continuation=canonical,
+            )
+
+    else:
+        pytest.importorskip("datasets")
+        from lerobot.inference import RTCInferenceEngine
+
+        engine = RTCInferenceEngine(
+            policy,
+            pre,
+            post,
+            robot_wrapper=SimpleNamespace(robot_type="test", action_features={}, supports_hold=True),
+            rtc_config=policy.config.rtc_config,
+            dataset_features={ACTION: {"shape": (8,)}},
+            task="pick",
+            fps=30,
+            device="cpu",
+            rtc_queue_threshold=2,
+        )
+
+        def predict(features, previous=None, canonical=None, delay=0):
+            return engine._predict_observation(features, "pick", mode, previous, canonical, delay)
+
     features = {feature.name: np.zeros(feature.shape, dtype=feature.dtype) for feature in kwargs["features"]}
     features[OBS_STATE][6] = 1.0
-    first = runner.predict(ObservationSnapshot(features, 1.0, "pick"), mode=ExecutionMode.RTC_GUIDED)
+    first = predict(features)
     features[OBS_STATE] = np.array([1, 2, 3, 0, 0, 2**-0.5, 2**-0.5, 0.5], dtype=np.float32)
-    second = runner.predict(
-        ObservationSnapshot(features, 2.0, "pick"),
-        mode=ExecutionMode.RTC_GUIDED,
-        model_continuation=first.model_actions[3:],
-        canonical_continuation=first.canonical_actions[3:],
-    )
+    second = predict(features, first.model_actions[3:], first.canonical_actions[3:], delay=2)
     prefix = policy.last_kwargs["prev_chunk_left_over"]
-    decoded = to_absolute_ee_actions(
-        prefix, torch.from_numpy(features[OBS_STATE]), policy.config.rotation_representation
+    # The deployed prefix must be encoded exactly like clean training actions,
+    # using the new raw reference pose and the checkpoint's action statistics.
+    training = pre(
+        {
+            OBS_STATE: torch.from_numpy(features[OBS_STATE]).unsqueeze(0),
+            ACTION: first.canonical_actions[3:7].unsqueeze(0),
+        }
     )
-    torch.testing.assert_close(decoded, first.canonical_actions[3:7], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(prefix, training[ACTION][0])
+    relative_prefix = prefix * stats[ACTION]["std"] + stats[ACTION]["mean"] if normalized else prefix
+    decoded = to_absolute_ee_actions(
+        relative_prefix, torch.from_numpy(features[OBS_STATE]), policy.config.rotation_representation
+    )
+    expected = first.canonical_actions[3:7]
+    torch.testing.assert_close(decoded[:, :3], expected[:, :3], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(decoded[:, 7:], expected[:, 7:], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+        (decoded[:, 3:7] * expected[:, 3:7]).sum(-1).abs(), torch.ones(4), atol=1e-6, rtol=1e-5
+    )
+    if mode is ExecutionMode.RTC_TRAINED:
+        torch.testing.assert_close(second.model_actions[:2], prefix[:2])
+        torch.testing.assert_close(second.canonical_actions[:2], decoded[:2], atol=1e-6, rtol=1e-5)
     assert torch.isfinite(second.canonical_actions).all()
     assert second.canonical_actions.shape == (8, 8)
+
+
+@pytest.mark.parametrize("owner", ["runner", "local"])
+def test_relative_ee_trained_rtc_requires_a_trained_checkpoint(ee_deployment, owner):
+    policy, pre, post, kwargs = ee_deployment
+    policy.config.rtc_training_max_delay = 0
+    policy.config.rtc_config = RTCConfig(mode="trained", execution_horizon=4)
+    with pytest.raises(ValueError, match="execution mode|Unsupported execution mode"):
+        if owner == "runner":
+            PolicyRunner(policy, pre, post, modes=(ExecutionMode.RTC_TRAINED,), **kwargs)
+        else:
+            pytest.importorskip("datasets")
+            from lerobot.inference import RTCInferenceEngine
+
+            RTCInferenceEngine(
+                policy,
+                pre,
+                post,
+                robot_wrapper=SimpleNamespace(robot_type="test", action_features={}, supports_hold=True),
+                rtc_config=policy.config.rtc_config,
+                dataset_features={ACTION: {"shape": (8,)}},
+                task="pick",
+                fps=30,
+                device="cpu",
+            )
 
 
 def test_runner_rejects_model_action_width_inconsistent_with_rotation_representation(ee_deployment):

@@ -519,6 +519,7 @@ def make_fineart_vla_pre_post_processors(
     else:
         from lerobot.datasets.recipe import TrainingRecipe  # recipes need the dataset extras
 
+        assert config.recipe is not None  # The recipe-free path returned above.
         recipe = TrainingRecipe.from_dict(config.recipe)
         input_steps.extend(
             [

@@ -17,7 +17,7 @@
 """
 Evaluate Real-Time Chunking (RTC) performance on dataset samples.
 
-This script takes two random samples from a dataset:
+This script takes two overlapping samples from one dataset episode:
 - Uses actions from the first sample as previous chunk
 - Generates new actions for the second sample with and without RTC
 
@@ -111,11 +111,17 @@ except ImportError:
 
 from lerobot.configs import DatasetConfig, PreTrainedConfig, RTCAttentionSchedule, parser
 from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata, resolve_delta_timestamps
+from lerobot.inference import prepare_continuation
 from lerobot.policies import get_policy_class, make_pre_post_processors
-from lerobot.policies.rtc import RTCConfig
+from lerobot.policies.rtc import RTCConfig, validate_trained_rtc_horizon
 from lerobot.policies.rtc.debug_visualizer import RTCDebugVisualizer
+from lerobot.processor import NormalizerProcessorStep, RelativeActionsProcessorStep, RelativeEEActionsStep
+from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.utils import init_logging
+
+# These policies compile their own sampler through ``compile_model``.
+_SELF_COMPILING_POLICIES = {"pi05", "pi0", "fineart_vla"}
 
 
 def set_seed(seed: int):
@@ -140,6 +146,11 @@ def _check_matplotlib_available():
             "Please install it by running:\n"
             "  uv pip install matplotlib"
         )
+
+
+def _frame_offset(chunk_size: int) -> int:
+    """Frames between the two sampled chunks; the rest of the chunk is their overlap."""
+    return max(1, chunk_size // 2)
 
 
 @dataclass
@@ -243,6 +254,7 @@ class RTCEvaluator:
     def __init__(self, cfg: RTCEvalConfig):
         self.cfg = cfg
         self.device = cfg.device
+        self._validate_prefix_bounds()
 
         # Load dataset with proper delta_timestamps based on policy configuration
         # Calculate delta_timestamps using the same logic as make_dataset factory
@@ -278,6 +290,23 @@ class RTCEvaluator:
         logging.info("  Note: Only one policy in memory at a time for efficient memory usage")
         logging.info("=" * 80)
 
+    def _validate_prefix_bounds(self) -> None:
+        """Reject a prefix the sampled chunks or the checkpoint cannot support, before loading anything."""
+        chunk = self.cfg.policy.chunk_size
+        overlap = chunk - _frame_offset(chunk)
+        delay, horizon = self.cfg.inference_delay, self.cfg.rtc.execution_horizon
+        if not 0 <= delay <= overlap:
+            raise ValueError(f"inference_delay must fit the {overlap}-step overlap between dataset chunks")
+        if not 0 < horizon <= overlap:
+            raise ValueError(f"execution_horizon must fit the {overlap}-step overlap between dataset chunks")
+        if self.cfg.rtc.mode == "trained":
+            max_delay = getattr(self.cfg.policy, "rtc_training_max_delay", 0)
+            validate_trained_rtc_horizon(horizon, chunk, max_delay)
+            if delay > max_delay:
+                raise ValueError(
+                    f"inference_delay ({delay}) exceeds the checkpoint's rtc_training_max_delay ({max_delay})"
+                )
+
     def _init_policy(self, name: str, rtc_enabled: bool, rtc_debug: bool):
         """Initialize a single policy instance with specified RTC configuration.
 
@@ -296,7 +325,7 @@ class RTCEvaluator:
 
         config = PreTrainedConfig.from_pretrained(self.cfg.policy.pretrained_path)
 
-        if self.cfg.policy.type == "pi05" or self.cfg.policy.type == "pi0":
+        if self.cfg.policy.type in _SELF_COMPILING_POLICIES:
             config.compile_model = self.cfg.use_torch_compile
 
         policy = policy_class.from_pretrained(self.cfg.policy.pretrained_path, config=config)
@@ -338,8 +367,7 @@ class RTCEvaluator:
             Policy with compiled predict_action_chunk method
         """
 
-        # PI models handle their own compilation
-        if policy.type == "pi05" or policy.type == "pi0":
+        if policy.config.type in _SELF_COMPILING_POLICIES:
             return policy
 
         try:
@@ -415,8 +443,43 @@ class RTCEvaluator:
         except Exception as e:
             logging.warning(f"  Warning: Error during {policy_name} cleanup: {e}")
 
+    def _sample_overlapping_pair(self) -> tuple[dict, dict, int]:
+        """Choose full action chunks in one episode and return their frame offset."""
+        chunk = self.cfg.policy.chunk_size
+        offset = _frame_offset(chunk)
+        ranges = []
+        for episode in self.dataset.meta.episodes:
+            start = int(episode["dataset_from_index"])
+            last_start = int(episode["dataset_to_index"]) - chunk - offset
+            if last_start >= start:
+                ranges.append((start, last_start))
+        if not ranges:
+            raise ValueError(f"RTC evaluation requires an episode with at least {chunk + offset} frames")
+        start, last_start = random.choice(ranges)
+        first = random.randint(start, last_start)
+        return (
+            lerobot_collate_fn([self.dataset[first]]),
+            lerobot_collate_fn([self.dataset[first + offset]]),
+            offset,
+        )
+
+    def _reanchor_prefix(self, model_actions: torch.Tensor, canonical_actions: torch.Tensor) -> torch.Tensor:
+        """Use the freshly preprocessed observation's anchor, as local/remote RTC do."""
+        steps = self.preprocessor.steps
+        relative = [s for s in steps if isinstance(s, RelativeActionsProcessorStep) and s.enabled]
+        return prepare_continuation(
+            model_actions,
+            canonical_actions,
+            model_action_dim=model_actions.shape[1],
+            horizon=len(model_actions),
+            device=self.device,
+            relative_step=next((s for s in relative if not isinstance(s, RelativeEEActionsStep)), None),
+            relative_ee_step=next((s for s in relative if isinstance(s, RelativeEEActionsStep)), None),
+            normalizer_step=next((s for s in steps if isinstance(s, NormalizerProcessorStep)), None),
+        )
+
     def run_evaluation(self):
-        """Run evaluation on two random dataset samples using three separate policies.
+        """Run evaluation on overlapping dataset samples using three separate policies.
 
         Note: Policies are deinitialized after each step to free memory. Large models
         (e.g., VLA models with billions of parameters) cannot fit three instances in
@@ -432,14 +495,8 @@ class RTCEvaluator:
         logging.info(f"Inference delay: {self.cfg.inference_delay}")
         logging.info("=" * 80)
 
-        # Load two random samples from dataset
-        data_loader = torch.utils.data.DataLoader(self.dataset, batch_size=1, shuffle=True)
-        loader_iter = iter(data_loader)
-        first_sample = next(loader_iter)
-        second_sample = next(loader_iter)
-
+        first_sample, second_sample, frame_offset = self._sample_overlapping_pair()
         preprocessed_first_sample = self.preprocessor(first_sample)
-        preprocessed_second_sample = self.preprocessor(second_sample)
 
         # ============================================================================
         # Step 1: Generate previous chunk using policy_prev_chunk
@@ -456,13 +513,18 @@ class RTCEvaluator:
             rtc_debug=False,
         )
         with torch.no_grad():
-            prev_chunk_left_over = policy_prev_chunk_policy.predict_action_chunk(
-                preprocessed_first_sample,
-            )[:, :25, :].squeeze(0)
+            previous = policy_prev_chunk_policy.predict_action_chunk(preprocessed_first_sample)
+            # Postprocess before the next observation changes the cached relative anchor.
+            canonical_previous = self.postprocessor(previous.clone())
+            prev_chunk_left_over = previous[:, frame_offset:, :].squeeze(0).clone()
+            canonical_left_over = canonical_previous[:, frame_offset:, :].squeeze(0).clone()
         logging.info(f"  Generated prev_chunk shape: {prev_chunk_left_over.shape}")
 
         # Destroy policy_prev_chunk to free memory for large models
         self._destroy_policy(policy_prev_chunk_policy, "policy_prev_chunk")
+
+        preprocessed_second_sample = self.preprocessor(second_sample)
+        prev_chunk_left_over = self._reanchor_prefix(prev_chunk_left_over, canonical_left_over)
 
         # ============================================================================
         # Step 2: Generate actions WITHOUT RTC using policy_no_rtc

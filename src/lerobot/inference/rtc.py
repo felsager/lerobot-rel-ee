@@ -21,7 +21,7 @@ import logging
 import math
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
@@ -257,12 +257,6 @@ class RTCInferenceEngine(InferenceEngine):
             logger.info("Relative actions enabled: RTC prefix will be re-anchored")
 
         if self._relative_ee_step is not None:
-            if rtc_config.mode == "trained":
-                raise ValueError(
-                    "Relative EE policies are only compatible with the guided RTC mode: their training "
-                    "never samples delayed prefixes, so --inference.rtc.mode=trained has no trained "
-                    "capacity to draw on. Use --inference.rtc.mode=guided (the default)."
-                )
             logger.info("Relative EE enabled: RTC prefix will be re-anchored in SE(3)")
 
     # ------------------------------------------------------------------
@@ -381,7 +375,7 @@ class RTCInferenceEngine(InferenceEngine):
 
     def _predict_observation(
         self,
-        features: dict[str, Any],
+        features: Mapping[str, Any],
         task: str,
         mode: ExecutionMode,
         previous: torch.Tensor | None,

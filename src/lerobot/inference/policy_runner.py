@@ -237,8 +237,6 @@ class PolicyRunner:
             and state.names != action.names
         ):
             raise ValueError("State and action component order must be aligned.")
-        if self._relative_ee_step is not None and ExecutionMode.RTC_TRAINED in self.capabilities.modes:
-            raise ValueError("Relative EE policies only support guided RTC.")
 
     def _batch(self, observation: ObservationSnapshot) -> dict[str, Any]:
         if set(observation.features) != {feature.name for feature in self.capabilities.features}:

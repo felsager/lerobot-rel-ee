@@ -50,6 +50,7 @@ else:
     sdpa_attention_forward = None
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs import PreTrainedConfig
+from lerobot.policies.rtc.training import reduce_training_rtc_loss, sample_training_rtc_prefix_mask
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -126,39 +127,6 @@ def _prepare_trained_rtc_prefix(
     prefix_mask = torch.arange(x_t.shape[1], device=x_t.device) < inference_delay
     prefix_mask = prefix_mask[None, :, None].expand(x_t.shape[0], -1, x_t.shape[2])
     return padded_prefix, prefix_mask
-
-
-def _sample_training_rtc_prefix_mask(
-    batch_size: int,
-    action_horizon: int,
-    max_delay: int,
-    device: torch.device,
-) -> Tensor | None:
-    """Sample a clean action-prefix length independently for each training example."""
-    if max_delay <= 0:
-        return None
-    delays = torch.randint(0, max_delay + 1, (batch_size,), device=device)
-    positions = torch.arange(action_horizon, device=device)
-    return positions.unsqueeze(0) < delays.unsqueeze(1)
-
-
-def _reduce_training_rtc_loss(
-    losses: Tensor,
-    prefix_mask: Tensor | None,
-    reduction: str,
-) -> Tensor:
-    """Average flow loss over predicted postfix actions, excluding the clean RTC prefix."""
-    if reduction not in {"mean", "none"}:
-        raise ValueError(f"Unsupported loss reduction: {reduction!r}")
-    if prefix_mask is None:
-        return losses.mean() if reduction == "mean" else losses.mean(dim=(1, 2))
-
-    postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
-    if reduction == "none":
-        numerator = (losses * postfix_mask).sum(dim=(1, 2))
-        denominator = postfix_mask.sum(dim=(1, 2))
-        return numerator / denominator.clamp(min=1)
-    return (losses * postfix_mask).sum() / postfix_mask.sum().clamp(min=1)
 
 
 def _no_grad_if(enabled: bool):
@@ -1615,7 +1583,7 @@ class PI05Policy(PreTrainedPolicy):
 
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
-        prefix_mask = _sample_training_rtc_prefix_mask(
+        prefix_mask = sample_training_rtc_prefix_mask(
             actions.shape[0],
             actions.shape[1],
             self.config.rtc_training_max_delay,
@@ -1650,11 +1618,11 @@ class PI05Policy(PreTrainedPolicy):
         loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist()}
 
         if reduction == "none":
-            per_sample_loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="none")
+            per_sample_loss = reduce_training_rtc_loss(losses, prefix_mask, reduction="none")
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
 
-        loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="mean")
+        loss = reduce_training_rtc_loss(losses, prefix_mask, reduction="mean")
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 

@@ -31,6 +31,8 @@ from torch import Tensor
 from torch.nn import functional
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from lerobot.policies.common.flow_matching import FlowConvention, make_flow_matching_inputs
+from lerobot.policies.rtc.training import reduce_training_rtc_loss, sample_training_rtc_prefix_mask
 from lerobot.utils.constants import (
     ACTION,
     ACTION_CODE_TOKEN_MASK,
@@ -121,8 +123,8 @@ class FineARTVLAPytorch(PI05Pytorch):  # see openpi `PI0Pytorch`
         state_masks=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        if prefix_mask is not None or states is not None or state_masks is not None:
-            # Training-time RTC / proprioceptive memory inputs are handled by the PI05 path.
+        if states is not None or state_masks is not None:
+            # Proprioceptive memory inputs are handled by the PI05 path.
             return super().forward(
                 images,
                 img_masks,
@@ -135,9 +137,9 @@ class FineARTVLAPytorch(PI05Pytorch):  # see openpi `PI0Pytorch`
                 states=states,
                 state_masks=state_masks,
             )
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t, u_t, model_time = make_flow_matching_inputs(
+            actions, noise, time, convention=FlowConvention.NOISE_AT_ONE, prefix_mask=prefix_mask
+        )
 
         # The prefix has no gradient path to a flow-only loss under KI.
         suppress_prefix = bool(getattr(self.config, "knowledge_insulation", False))
@@ -145,7 +147,7 @@ class FineARTVLAPytorch(PI05Pytorch):  # see openpi `PI0Pytorch`
             prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                 images, img_masks, tokens, masks
             )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -1010,12 +1012,15 @@ class FineARTVLAPolicy(PI05Policy):
 
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        action_prefix_mask = sample_training_rtc_prefix_mask(
+            actions.shape[0], actions.shape[1], self.config.rtc_training_max_delay, actions.device
+        )
+        x_t, u_t, model_time = make_flow_matching_inputs(
+            actions, noise, time, convention=FlowConvention.NOISE_AT_ONE, prefix_mask=action_prefix_mask
+        )
 
         # ---- suffix: noisy actions ----------------------------------
-        suffix_embs, suffix_pad, suffix_att, adarms_cond = self.model.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad, suffix_att, adarms_cond = self.model.embed_suffix(x_t, model_time)
 
         # ---- bf16 alignment (mirrors PI05Pytorch.forward) -----------
         first_layer = self.model.paligemma_with_expert.paligemma.model.language_model.layers[0]
@@ -1063,7 +1068,7 @@ class FineARTVLAPolicy(PI05Policy):
             raise ValueError("output_features must be configured before computing actions")
         original_action_dim = self.config.output_features[ACTION].shape[0]
         flow_per_dim = flow_per_dim[:, :, :original_action_dim]
-        per_sample_flow = flow_per_dim.mean(dim=(1, 2))
+        per_sample_flow = reduce_training_rtc_loss(flow_per_dim, action_prefix_mask, reduction="none")
         flow_loss = _reduce_action_loss(per_sample_flow, predict_actions_t, reduction)
         return prefix_out, flow_loss
 
@@ -1111,10 +1116,13 @@ class FineARTVLAPolicy(PI05Policy):
         noise = model.sample_noise((k * batch_size, *actions.shape[1:]), actions.device)
         time = model.sample_time(k * batch_size, actions.device)
         actions_rep = actions.repeat(k, 1, 1)  # (k*B, chunk, motor_dim)
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions_rep
-        u_t = (noise - actions_rep).view(k, batch_size, chunk, -1).transpose(0, 1)  # (B, k, chunk, motor)
-        s_embs, suffix_pad, suffix_att, adarms = model.embed_suffix(x_t, time)
+        action_prefix_mask = sample_training_rtc_prefix_mask(
+            k * batch_size, chunk, self.config.rtc_training_max_delay, actions.device
+        )
+        x_t, u_t, model_time = make_flow_matching_inputs(
+            actions_rep, noise, time, convention=FlowConvention.NOISE_AT_ONE, prefix_mask=action_prefix_mask
+        )
+        s_embs, suffix_pad, suffix_att, adarms = model.embed_suffix(x_t, model_time)
         if use_bf16:
             s_embs = s_embs.to(dtype=torch.bfloat16)
         suffix_pad = suffix_pad[:batch_size]
@@ -1122,10 +1130,12 @@ class FineARTVLAPolicy(PI05Policy):
         suffix_embs = (
             s_embs.view(k, batch_size, chunk, -1).transpose(0, 1).reshape(batch_size, k * chunk, -1)
         )  # (B, k*chunk, D)
-        # Broadcast each draw's AdaRMS condition over its action chunk.
+        # Scalar-time draws share their condition across the chunk; RTC already provides
+        # one condition per action. Preserve the independent draw/action ordering in both cases.
+        if adarms.ndim == 2:
+            adarms = adarms[:, None, :].expand(-1, chunk, -1)
         adarms_cond = (
-            adarms.view(k, batch_size, 1, adarms.shape[-1])
-            .expand(k, batch_size, chunk, adarms.shape[-1])
+            adarms.reshape(k, batch_size, chunk, adarms.shape[-1])
             .transpose(0, 1)
             .reshape(batch_size, k * chunk, adarms.shape[-1])
         )  # (B, k*chunk, cond_dim)
@@ -1195,9 +1205,11 @@ class FineARTVLAPolicy(PI05Policy):
             raise ValueError("output_features must be configured before computing actions")
         original_action_dim = self.config.output_features[ACTION].shape[0]
         v_t = model.action_out_proj(suffix_out.to(dtype=torch.float32))
-        v_t = v_t.view(batch_size, k, chunk, -1)  # (B, k, chunk, motor)
+        # Reorder the blocks to match u_t and action_prefix_mask: by draw, then by example.
+        v_t = v_t.view(batch_size, k, chunk, -1).transpose(0, 1).flatten(0, 1)  # (k*B, chunk, motor)
         flow_per_dim = functional.mse_loss(u_t, v_t, reduction="none")[..., :original_action_dim]
-        per_sample_flow = flow_per_dim.mean(dim=(1, 2, 3))
+        per_draw_flow = reduce_training_rtc_loss(flow_per_dim, action_prefix_mask, reduction="none")
+        per_sample_flow = per_draw_flow.view(k, batch_size).mean(dim=0)
         flow_loss = _reduce_action_loss(per_sample_flow, predict_actions_t, reduction)
         return prefix_out, flow_loss
 

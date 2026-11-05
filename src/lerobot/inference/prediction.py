@@ -69,7 +69,7 @@ class ChunkPrediction:
     predicted_at: float
 
 
-def _prepare_continuation(
+def prepare_continuation(
     model: torch.Tensor | None,
     canonical: torch.Tensor | None,
     *,
@@ -81,6 +81,7 @@ def _prepare_continuation(
     normalizer_step: NormalizerProcessorStep | None,
     current_state=None,
 ) -> torch.Tensor | None:
+    """Validate an RTC continuation, re-anchor relative actions and fit it to ``horizon``."""
     if model is None or model.numel() == 0:
         return None
 
@@ -147,7 +148,7 @@ def predict_chunk(
         if mode is ExecutionMode.CHUNK:
             predicted = policy.predict_action_chunk(prepared)
         else:
-            prefix = _prepare_continuation(
+            prefix = prepare_continuation(
                 model_continuation,
                 canonical_continuation,
                 model_action_dim=model_action_dim or canonical_action_dim,

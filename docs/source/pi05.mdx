@@ -231,6 +231,11 @@ latency spike past the trained range discards that chunk and retries; rollout
 stops with an explicit error only if the delay stays out of range. The default
 `--inference.rtc.mode=guided` remains available for ordinary checkpoints.
 
+For training-time RTC with relative end-effector actions, set
+`--policy.use_relative_ee=true --policy.rtc_training_max_delay=10` on an absolute
+EE dataset. See [RTC training](./rtc#train-rtc-with-relative-ee-actions) for the
+full command and matching trained-mode deployment settings.
+
 ### Loading a checkpoint
 
 The two forms are not interchangeable:

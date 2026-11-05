@@ -61,6 +61,14 @@ uv run lerobot-train \
     --output_dir=outputs/train/fineart_rel_ee
 ```
 
+Add `--policy.rtc_training_max_delay=10` to train clean action-prefix conditioning
+for trained RTC, including with relative EE actions. This works with both the
+action-only prompt and language recipes. Independent repeated flow draws also
+work, except without a recipe and with `enable_fast_action_loss=false`, where
+training takes one draw whatever `flow_num_repeats` says. See
+[RTC training](./rtc#train-rtc-with-relative-ee-actions) for commands, loss
+masking, and deployment bounds.
+
 With `torchrun`, divide the configured batch size by the number of processes to
 preserve effective batch 16. Do not add `--policy.path=lerobot/pi05_base`: it
 selects the checkpoint's PI05 policy type. The example instead selects

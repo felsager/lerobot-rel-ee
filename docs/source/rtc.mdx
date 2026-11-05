@@ -1,6 +1,6 @@
 # Real-Time Chunking (RTC)
 
-Real-Time Chunking (RTC) allows large, flow-matching based robotic policies, such as [Pi0](./pi0), [Pi0.5](./pi05), and [SmolVLA](./smolvla), to produce smooth, continuous, and reactive motion despite having high inference latency. LeRobot provides the original inference-time guided mode and, for compatible Pi05 checkpoints, training-time action conditioning with cheap hard-prefix inference.
+Real-Time Chunking (RTC) allows large, flow-matching based robotic policies, such as [Pi0](./pi0), [Pi0.5](./pi05), and [SmolVLA](./smolvla), to produce smooth, continuous, and reactive motion despite having high inference latency. LeRobot provides the original inference-time guided mode and, for compatible Pi05 and [FineART-VLA](./fineart_vla) checkpoints, training-time action conditioning with cheap hard-prefix inference.
 
 These policies generate chunks of future actions (e.g., 50 steps at a time) instead of single actions.
 Because the models are large, producing each chunk takes longer than the time it takes the robot to execute it.
@@ -88,6 +88,70 @@ for step in range(num_steps):
     execute_actions(action)
 ```
 
+## Train RTC with relative EE actions
+
+Pi05 and FineART-VLA support `policy.rtc_training_max_delay` with relative EE
+actions. The dataset must contain absolute 8D `[xyz, qx, qy, qz, qw, gripper]`
+actions and states. Preprocessing transforms the whole target chunk into the
+current observation's EE frame, converts its rotation representation, and
+normalizes it using the training action statistics.
+
+For each flow draw, training uniformly samples a delay from zero through
+`rtc_training_max_delay`, inclusive. That many initial actions stay clean and
+receive flow time zero; only the remaining actions contribute to the flow loss.
+The delay must be an integer smaller than `chunk_size`. The default, zero,
+preserves ordinary flow training and does not enable trained RTC deployment.
+Training does not require enabling `policy.rtc_config`: that config controls
+inference.
+
+For Pi05, start from the base weights and choose your EE dataset:
+
+```bash
+uv run lerobot-train \
+    --dataset.repo_id=${HF_USERNAME}/ee_demos \
+    --policy.type=pi05 \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.use_relative_ee=true \
+    --policy.rotation_representation=rot6d \
+    --policy.rot6d_identity_norm=true \
+    --policy.rtc_training_max_delay=10 \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=50 \
+    --policy.dtype=bfloat16 \
+    --policy.device=cuda \
+    --policy.push_to_hub=false \
+    --batch_size=16 \
+    --steps=30000 \
+    --output_dir=outputs/train/pi05_rel_ee_rtc
+```
+
+For FineART-VLA, enable RTC on the existing relative EE action-only recipe:
+
+```bash
+uv run lerobot-train \
+    --config_path=examples/training/fineart_rel_ee.yaml \
+    --dataset.repo_id=${HF_USERNAME}/ee_demos \
+    --policy.rtc_training_max_delay=10 \
+    --policy.push_to_hub=false \
+    --save_checkpoint_to_hub=false \
+    --output_dir=outputs/train/fineart_rel_ee_rtc
+```
+
+The same delay setting works with FineART's language recipes, knowledge
+insulation, and `flow_num_repeats > 1`. Each repeated draw samples its own delay
+and normalizes its loss over its predicted postfix before averaging draws.
+Without a recipe and with `enable_fast_action_loss=false`, FineART uses the Pi05
+training path, which takes one draw whatever `flow_num_repeats` says.
+Text and FAST auxiliary objectives keep their usual supervision; FAST target
+tokens remain hidden from the action expert.
+
+At deployment, select `--inference.rtc.mode=trained`. Both local and remote
+inference reconstruct leftover actions in canonical absolute EE coordinates,
+then reanchor and normalize them against the new observation before hard
+inpainting. Reusing the previous chunk's normalized local coordinates directly
+would condition the model on the wrong pose. Keep the checkpoint's processors,
+rotation representation, and action statistics together.
+
 ## Key Parameters
 
 `RTCConfig` has the following parameters to tune:
@@ -95,18 +159,18 @@ for step in range(num_steps):
 **`mode`** selects the action-prefix conditioning method:
 
 - `guided` (default) applies the original Jacobian guidance during denoising and works with ordinary flow-matching checkpoints.
-- `trained` hard-inpaints the previous chunk's prefix with per-action flow timesteps. It currently requires a Pi05 checkpoint trained with `policy.rtc_training_max_delay > 0` and avoids the guidance backward pass.
+- `trained` hard-inpaints the previous chunk's prefix with per-action flow timesteps. It requires a Pi05 or FineART-VLA checkpoint trained with `policy.rtc_training_max_delay > 0` and avoids the guidance backward pass.
 
 Local rollout and the policy server apply the same conservative trained-mode
 admission rule: `rtc_training_max_delay <= execution_horizon <= prediction_steps - rtc_training_max_delay`.
-For Pi05, `prediction_steps` is the checkpoint's `chunk_size`. This preserves the
+For Pi05 and FineART-VLA, `prediction_steps` is the checkpoint's `chunk_size`. This preserves the
 existing local limit: the configured prefix covers the maximum trained delay and
 leaves at least that many predicted steps outside it. Local rollout additionally
 requires `inference.queue_threshold >= rtc_training_max_delay` before connecting
 the robot; remote request timing uses its own refill settings.
 
 Here `execution_horizon` is supplied prefix capacity, not the amount of playback
-between requests. Pi05 hard-conditions only the `inference_delay` prefix. The
+between requests. These policies hard-condition only the `inference_delay` prefix. The
 admission rule is not a latency guarantee or a claim that larger capacities must
 fail at runtime; measured overlap, remaining actions and freshness checks still
 determine whether a returned chunk can execute. Plain chunks and guided RTC are
@@ -142,9 +206,11 @@ python examples/rtc/eval_dataset.py \
     --device=cuda
 ```
 
-Add `--rtc.mode=trained` when evaluating a compatible training-time RTC Pi05
-checkpoint. Unsupported policies reject trained mode instead of falling back to
-guided RTC.
+Add `--rtc.mode=trained` when evaluating a compatible training-time RTC Pi05 or
+FineART-VLA checkpoint. The evaluator selects overlapping full chunks from the
+same episode and reanchors the previous chunk's tail for relative actions. Its
+execution horizon and delay must fit the overlap (half the action chunk).
+Unsupported policies reject trained mode instead of falling back to guided RTC.
 
 The script generates a visualization of the denoising process, comparing standard generation (left) with RTC (right). In the RTC plots, you can see how the first few steps (blue/purple lines) are guided to match the red ground truth trajectory (previous chunk's tail), ensuring a smooth transition between chunks.
 
@@ -174,7 +240,7 @@ lerobot-rollout \
     --device=cuda
 ```
 
-For a training-time RTC Pi05 checkpoint, change the mode to `trained`. The
+For a training-time RTC Pi05 or FineART-VLA checkpoint, change the mode to `trained`. The
 checkpoint records its maximum supported delay, and rollout validates measured
 latency against it:
 
