@@ -24,6 +24,11 @@ import torch
 pytest.importorskip("transformers")
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
+fft = pytest.importorskip("scipy.fft")
+
+from tokenizers import ByteLevelBPETokenizer  # noqa: E402
+from tokenizers.trainers import BpeTrainer  # noqa: E402
+from transformers import PreTrainedTokenizerFast  # noqa: E402
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature  # noqa: E402
 from lerobot.policies.factory import make_pre_post_processors  # noqa: E402
@@ -180,3 +185,53 @@ def test_fit_rejects_combined_relative_modes(tmp_path):
         fitting.fit_fast_tokenizer(
             dataset_repo_id="test/ee", cache_dir=tmp_path, use_relative_ee=True, use_relative_actions=True
         )
+
+
+def test_fast_byte_alphabet_preserves_unseen_coefficients(tmp_path, monkeypatch):
+    # Smooth chunks leave many coefficient values unseen during fitting. Reproduce
+    # the upstream initial alphabet with real BPE, not an identity tokenizer mock.
+    rng = np.random.default_rng(42)
+    rng.uniform(-1, 1, (32, 50, 10))
+    actions = np.repeat(rng.uniform(-1, 1, (32, 1, 10)), 50, axis=1).astype(np.float32)
+    coefficients = np.around(fft.dct(actions, axis=1, norm="ortho") * 10).astype(int)
+    minimum, maximum = int(coefficients[:24].min()), int(coefficients[:24].max())
+    strings = ["".join(map(chr, np.maximum(chunk.flatten() - minimum, 0))) for chunk in coefficients]
+    bpe = ByteLevelBPETokenizer()
+    bpe._tokenizer.train_from_iterator(
+        strings[:24],
+        trainer=BpeTrainer(
+            vocab_size=1024,
+            min_frequency=2,
+            show_progress=False,
+            special_tokens=[],
+            initial_alphabet=[chr(i) for i in range(maximum - minimum + 1)],
+            max_token_length=10000,
+        ),
+    )
+    fitted = SimpleNamespace(
+        bpe_tokenizer=PreTrainedTokenizerFast(tokenizer_object=bpe, clean_up_tokenization_spaces=False),
+        scale=10,
+        min_token=minimum,
+        vocab_size=1024,
+    )
+    assert any(
+        fitted.bpe_tokenizer.decode(fitted.bpe_tokenizer(text)["input_ids"]) != text for text in strings[24:]
+    )
+
+    fitting._ensure_byte_level_alphabet(fitted, actions[:24])
+    # Encoding is lossless even for coefficient characters absent from training.
+    for text in [*strings[24:], "".join(map(chr, range(1024)))]:
+        assert fitted.bpe_tokenizer.decode(fitted.bpe_tokenizer(text)["input_ids"]) == text
+
+    fitted.bpe_tokenizer.save_pretrained(tmp_path)
+    reloaded = PreTrainedTokenizerFast.from_pretrained(tmp_path)
+    reconstructed = []
+    for text in strings[24:]:
+        decoded = reloaded.decode(reloaded(text)["input_ids"])
+        decoded_coefficients = np.array(list(map(ord, decoded))).reshape(50, 10) + minimum
+        reconstructed.append(fft.idct(decoded_coefficients / 10, axis=0, norm="ortho"))
+    assert np.sqrt(np.mean((np.stack(reconstructed) - actions[24:]) ** 2)) < 0.01
+
+    # A backend that already preserves all bytes must not be retrained.
+    monkeypatch.setattr(fitting, "ByteLevelBPETokenizer", lambda: pytest.fail("unnecessary BPE refit"))
+    fitting._ensure_byte_level_alphabet(fitted, actions[:24])

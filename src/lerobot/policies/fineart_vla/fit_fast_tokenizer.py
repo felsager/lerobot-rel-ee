@@ -33,12 +33,22 @@ import torch
 from huggingface_hub import snapshot_download
 
 from lerobot.processor.relative_ee_action_processor import to_relative_ee_actions
-from lerobot.utils.import_utils import _datasets_available, _transformers_available, require_package
+from lerobot.utils.import_utils import (
+    _datasets_available,
+    _scipy_available,
+    _transformers_available,
+    require_package,
+)
 from lerobot.utils.rotation_representations import RotationRepresentation
 
 if TYPE_CHECKING or _transformers_available:
-    from transformers import AutoProcessor
+    from tokenizers import ByteLevelBPETokenizer
+    from tokenizers.pre_tokenizers import ByteLevel
+    from tokenizers.trainers import BpeTrainer
+    from transformers import AutoProcessor, PreTrainedTokenizerFast
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
+if TYPE_CHECKING or _scipy_available:
+    from scipy.fft import dct
 # pyarrow ships with the dataset extra; tokenizer fitting reads training parquet shards.
 if TYPE_CHECKING or _datasets_available:
     import pyarrow as pa
@@ -86,6 +96,7 @@ def _dataset_signature(
 ) -> str:
     """Hash every input that changes the fitted action distribution."""
     payload = {
+        "fitting_version": 2,  # Full byte alphabet for lossless BPE coefficient encoding.
         "dataset_repo_id": dataset_repo_id,
         "dataset_revision": dataset_revision,
         "base_tokenizer_name": base_tokenizer_name,
@@ -224,6 +235,39 @@ def _load_fast_fitter(base_tokenizer_name: str) -> Any:
             "processing_action_tokenizer.UniversalActionProcessor",
             base_tokenizer_name,
         )
+
+
+def _ensure_byte_level_alphabet(fitted: Any, actions: np.ndarray) -> None:
+    """Repair upstream FAST fits that omit byte symbols needed by unseen coefficients.
+
+    FAST represents quantized DCT coefficients as Unicode characters, then uses
+    ByteLevel BPE. Its initial alphabet must include all *byte-level* symbols;
+    raw coefficient characters alone can drop bytes or decode as U+FFFD. Keep
+    the fitted scale, coefficient offset, and processor implementation intact.
+    """
+    tokenizer = getattr(fitted, "bpe_tokenizer", None)
+    if tokenizer is None:
+        return
+    alphabet = ByteLevel.alphabet()
+    if set(alphabet).issubset(tokenizer.get_vocab()):
+        return
+    require_package("scipy", extra="pi")
+    logger.info("FAST fit: rebuilding BPE with the complete byte alphabet for unseen coefficients")
+    coefficients = np.around(dct(actions, axis=1, norm="ortho") * fitted.scale).astype(np.int64)
+    coefficients -= fitted.min_token
+    bpe = ByteLevelBPETokenizer()
+    trainer = BpeTrainer(
+        vocab_size=fitted.vocab_size,
+        min_frequency=2,
+        show_progress=True,
+        special_tokens=[],
+        initial_alphabet=alphabet,
+        max_token_length=10000,
+    )
+    bpe._tokenizer.train_from_iterator(
+        ("".join(map(chr, chunk.flatten())) for chunk in coefficients), trainer=trainer
+    )
+    fitted.bpe_tokenizer = PreTrainedTokenizerFast(tokenizer_object=bpe, clean_up_tokenization_spaces=False)
 
 
 def fit_fast_tokenizer(
@@ -465,6 +509,8 @@ def fit_fast_tokenizer(
     fit_actions = actions[:n_samples]
     validation_actions = actions[n_samples:total_samples]
     fitted = base.fit(fit_actions)
+    if base_tokenizer_name == "physical-intelligence/fast":
+        _ensure_byte_level_alphabet(fitted, fit_actions)
     validation_report, decoded_actions = _validate_fast_reconstruction(
         fitted,
         validation_actions,
