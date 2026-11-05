@@ -13,11 +13,14 @@ import random
 from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import draccus
 import numpy as np
 import pytest
 import torch
+from httpx import Request, Response
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError, RemoteEntryNotFoundError
 from torch.utils.data import DataLoader
 
 from lerobot.configs.default import DatasetConfig
@@ -181,13 +184,21 @@ def test_dataloader_resamples_reproducibly(training_config, streaming, workers):
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_missing_metadata_bank_requires_explicit_opt_in(training_config, streaming):
+def test_missing_metadata_bank_requires_explicit_opt_in(training_config, streaming, monkeypatch):
     training_config.dataset.streaming = streaming
+    download = Mock(
+        side_effect=RemoteEntryNotFoundError(
+            "No bank in this revision",
+            response=Response(404, request=Request("GET", "https://example.com/bank")),
+        )
+    )
+    monkeypatch.setattr(factory, "hf_hub_download", download)
     (Path(training_config.dataset.root) / "meta" / "paraphrases.json").unlink()
     with pytest.raises(FileNotFoundError, match="meta/paraphrases.json"):
         make_dataset(training_config)
     training_config.dataset.paraphrases = False
     assert make_dataset(training_config).task_paraphrases is None
+    download.assert_called_once()
 
 
 def test_paraphrases_boolean_cli_flag():
@@ -205,3 +216,53 @@ def test_uses_resolved_dataset_metadata_root(training_config, tmp_path, monkeypa
     monkeypatch.setattr(factory, "LeRobotDataset", lambda *args, **kwargs: dataset)
     loaded = make_dataset(training_config)
     assert loaded.task_paraphrases(TASK) == "carry red block."
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("revision", ["main", "v3.0", "0123456789abcdef"])
+def test_missing_local_bank_downloads_only_json_at_selected_revision(
+    training_config, tmp_path, monkeypatch, streaming, revision
+):
+    training_config.dataset.streaming = streaming
+    training_config.dataset.revision = revision
+    local_bank = Path(training_config.dataset.root) / "meta" / "paraphrases.json"
+    local_bank.unlink()
+    cached_bank = write_bank(tmp_path, {SOURCE: ["carry {object}."]})
+    download = Mock(return_value=str(cached_bank))
+    monkeypatch.setattr(factory, "hf_hub_download", download)
+    dataset = make_dataset(training_config)
+    assert dataset.task_paraphrases(TASK) == "carry red block."
+    download.assert_called_once_with(
+        repo_id="test/paraphrases",
+        filename="meta/paraphrases.json",
+        repo_type="dataset",
+        revision=revision,
+        cache_dir=factory.HF_LEROBOT_HUB_CACHE,
+    )
+    assert not local_bank.exists()
+    if not streaming:
+        torch.testing.assert_close(dataset[0]["action"], torch.tensor([[0.0, 0.0], [1.0, -1.0]]))
+
+
+def test_existing_local_bank_does_not_require_network(training_config, monkeypatch):
+    download = Mock(side_effect=AssertionError("Local banks must work offline"))
+    monkeypatch.setattr(factory, "hf_hub_download", download)
+    dataset = make_dataset(training_config)
+    assert dataset.task_paraphrases(TASK) in [text.format(object="red block") for text in REPLACEMENTS]
+    download.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        HfHubHTTPError(
+            "Access denied", response=Response(401, request=Request("GET", "https://example.com/bank"))
+        ),
+        LocalEntryNotFoundError("Offline"),
+    ],
+)
+def test_download_authentication_and_offline_errors_are_preserved(training_config, monkeypatch, error):
+    (Path(training_config.dataset.root) / "meta" / "paraphrases.json").unlink()
+    monkeypatch.setattr(factory, "hf_hub_download", Mock(side_effect=error))
+    with pytest.raises(type(error), match=str(error)):
+        make_dataset(training_config)

@@ -13,19 +13,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import logging
 import math
+from pathlib import Path
 from pprint import pformat
 from typing import Literal, cast
 
 import torch
+from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import RemoteEntryNotFoundError
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.compute_rel_ee_stats import load_or_compute_relative_ee_stats
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
+from lerobot.utils.constants import (
+    ACTION,
+    HF_LEROBOT_HUB_CACHE,
+    IMAGENET_STATS,
+    OBS_IMAGE,
+    OBS_PREFIX,
+    OBS_STATE,
+    REWARD,
+)
 from lerobot.utils.rotation_representations import RotationRepresentation
 
 from .dataset_metadata import LeRobotDatasetMetadata
@@ -276,6 +288,20 @@ def make_dataset(
 
     if cfg.dataset.paraphrases:
         path = dataset.meta.root / "meta" / "paraphrases.json"
+        # Existing local dataset trees may predate the bank. Fetch only the missing
+        # JSON, using the requested revision and the Hub's process-safe file cache.
+        if not path.is_file() and dataset.meta.repo_type == "dataset":
+            # A genuinely absent Hub file gets the actionable missing-bank error below.
+            with contextlib.suppress(RemoteEntryNotFoundError):
+                path = Path(
+                    hf_hub_download(
+                        repo_id=dataset.repo_id,
+                        filename="meta/paraphrases.json",
+                        repo_type="dataset",
+                        revision=dataset.meta.revision,
+                        cache_dir=HF_LEROBOT_HUB_CACHE,
+                    )
+                )
         if not path.is_file():
             raise FileNotFoundError(
                 f"dataset.paraphrases=true requires meta/paraphrases.json in "
