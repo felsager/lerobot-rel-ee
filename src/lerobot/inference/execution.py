@@ -239,7 +239,9 @@ class ChunkRuntime:
                 execution_generation=self.generation,
             )
 
-    def invalidate(self, *, held: bool = False, preserve_starvation: bool = False) -> int:
+    def invalidate(
+        self, *, held: bool = False, preserve_starvation: bool = False, reset_timing: bool = False
+    ) -> int:
         """Revoke old motion locally and return the new execution generation."""
         with self.lock:
             waiting_deadline = self.starvation_deadline if preserve_starvation else None
@@ -249,6 +251,10 @@ class ChunkRuntime:
                 pending_deadline = (
                     min(pending_deadline, deadline) if pending_deadline is not None else deadline
                 )
+            if reset_timing:
+                self.turnarounds.clear()
+                self._initial_turnaround = 0.0
+                self._completed = 0
             self.generation += 1
             self.queue.clear()
             self.pending = None

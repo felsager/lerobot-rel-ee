@@ -279,3 +279,19 @@ def test_trained_rtc_tolerates_one_overlap_miss_but_reports_persistent_delay():
         assert not engine.dispatch_allowed()
     finally:
         stop(engine)
+
+
+def test_explicit_engine_reset_clears_trial_latency_history():
+    engine = make_engine()
+    rt = engine._runtime
+    rt.turnarounds.extend([0.25, 2.53])
+    rt._initial_turnaround = 2.53
+    rt._completed = 100
+    generation = rt.generation
+    engine.reset()
+    assert not rt.turnarounds
+    assert rt.turnaround == 0
+    assert rt._initial_turnaround == 0
+    assert rt._completed == 0
+    assert rt.generation == generation + 1
+    assert rt.pending is None

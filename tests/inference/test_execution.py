@@ -218,3 +218,38 @@ def test_hold_state_upgrades_once_without_renewing_per_tick():
     assert not hold.expired(1e9)
     assert not hold.request("language", 31.0, 2.0, upgrade=True)
     assert hold.deadline == 32.0
+
+
+def test_trial_reset_clears_slow_history_and_rejects_old_result_before_reseeding():
+    rt, clock = runtime(ExecutionMode.RTC_GUIDED)
+    old = rt.begin(observation(clock))
+    rt.turnarounds.extend([0.25, 2.53])
+    rt._initial_turnaround = 1.7
+    rt._completed = 100
+    rt.invalidate(reset_timing=True)
+    assert rt.turnaround == 0
+    assert rt.effective_refill == rt.refill_seconds
+    assert rt._completed == 0
+    assert not rt.accept(old, chunk(old), task_version=0)
+    assert rt.turnaround == 0
+    request = rt.begin(observation(clock))
+    assert request.delay == 0
+    clock.now += 0.25
+    assert rt.accept(request, chunk(request), task_version=0)
+    assert abs(rt.turnaround - 0.25) < 1e-9
+    rt.pop()
+    successor = rt.begin(observation(clock))
+    assert successor.delay == 3  # ceil(250 ms / 100 ms action interval)
+    clock.now += 0.15
+    assert rt.accept(successor, chunk(successor), task_version=0)
+    assert abs(rt.turnaround - 0.15) < 1e-9  # first call is only a startup fallback
+    assert rt._completed == 2
+
+
+def test_ordinary_hold_retains_latency_history():
+    rt, _ = runtime(ExecutionMode.RTC_GUIDED)
+    rt.turnarounds.append(0.25)
+    rt._completed = 2
+    rt.invalidate(held=True)
+    assert rt.turnaround == 0.25
+    assert rt._completed == 2

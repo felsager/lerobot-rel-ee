@@ -497,7 +497,7 @@ class RTCInferenceEngine(InferenceEngine):
         return True
 
     def reset(self) -> None:
-        """Reset the policy, processors, and action queue.
+        """Reset policy, processors, action queue, and inference timing history.
 
         Safe to call with the RTC thread paused or running.  Also drops the last published
         observation — a chunk computed from a stale one would jerk the robot toward an old
@@ -510,7 +510,7 @@ class RTCInferenceEngine(InferenceEngine):
             # Clear and bump in one critical section, mirroring _rtc_loop's epoch
             # check-and-merge, so a reset cannot leak a pre-reset chunk into the fresh
             # queue.  Lock order is _obs_lock -> queue.lock on both sides.
-            self._runtime.invalidate()
+            self._runtime.invalidate(reset_timing=True)
             self._obs_holder["obs"] = None
             self._reset_epoch += 1
             self._reset_pending = True
