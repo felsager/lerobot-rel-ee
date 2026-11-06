@@ -197,3 +197,53 @@ def test_precomputed_weights_require_chunk_length():
             lambda x: x.sin(),
             prefix_weights=torch.ones(10),
         )
+
+
+def test_compiled_sampler_follows_live_rtc_tuning():
+    """A stale constant in a compiled graph would silently ignore a reload, so compare with eager."""
+    noise = torch.randn((1, 50, 8), generator=torch.Generator().manual_seed(23))
+    previous = noise[:, :20].clone() * 0.5
+    settings = [
+        {
+            "max_guidance_weight": 10.0,
+            "execution_horizon": 10,
+            "prefix_attention_schedule": RTCAttentionSchedule.EXP,
+        },
+        {
+            "max_guidance_weight": 2.0,
+            "execution_horizon": 10,
+            "prefix_attention_schedule": RTCAttentionSchedule.EXP,
+        },
+        {
+            "max_guidance_weight": 2.0,
+            "execution_horizon": 18,
+            "prefix_attention_schedule": RTCAttentionSchedule.EXP,
+        },
+        {
+            "max_guidance_weight": 2.0,
+            "execution_horizon": 18,
+            "prefix_attention_schedule": RTCAttentionSchedule.LINEAR,
+        },
+    ]
+
+    def run(policy, values):
+        for name, value in values.items():
+            setattr(policy.rtc_processor.rtc_config, name, value)
+        prefix = previous[:, : values["execution_horizon"]]
+        return policy.predict_action_chunk(
+            batch(), noise=noise, prev_chunk_left_over=prefix, inference_delay=4
+        )
+
+    eager = make_policy(compile_model=False, real_sampler=True)
+    expected = [run(eager, values) for values in settings]
+    assert all(not torch.equal(a, b) for a, b in zip(expected, expected[1:], strict=False))
+    policy = make_policy(compile_model=True, real_sampler=True)
+    torch._dynamo.reset()
+    try:
+        policy.model.sample_actions = torch.compile(
+            policy.model.sample_actions, backend=lambda graph, _inputs: graph.forward
+        )
+        for values, want in zip(settings + settings, expected + expected, strict=True):
+            torch.testing.assert_close(run(policy, values), want, rtol=0, atol=0)
+    finally:
+        torch._dynamo.reset()
