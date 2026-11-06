@@ -267,6 +267,7 @@ def euler_integrate(
     inference_delay: int | None = None,
     prev_chunk_left_over: Tensor | None = None,
     execution_horizon: int | None = None,
+    rtc_prefix_weights: Tensor | None = None,
     hard_prefix: Tensor | None = None,
     hard_prefix_mask: Tensor | None = None,
     precompute_times: bool = False,
@@ -310,6 +311,8 @@ def euler_integrate(
         inference_delay: RTC guidance parameter, forwarded verbatim.
         prev_chunk_left_over: RTC guidance parameter, forwarded verbatim.
         execution_horizon: RTC guidance parameter, forwarded verbatim.
+        rtc_prefix_weights: Optional precomputed RTC weights, forwarded to each guided step.
+            Construct them before entering a compiled sampler to avoid specializing on delay.
         hard_prefix: Optional clean action prefix to clamp throughout denoising.
         hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
         precompute_times: Retained for caller compatibility. Timestep values are now always
@@ -388,6 +391,7 @@ def euler_integrate(
                 rtc_time = 1.0 - rtc_time
 
         if guidance is not None:
+            prefix_kwargs = {"prefix_weights": rtc_prefix_weights} if rtc_prefix_weights is not None else {}
             v_t = guidance.denoise_step(
                 x_t=x_t,
                 prev_chunk_left_over=prev_chunk_left_over,
@@ -397,6 +401,7 @@ def euler_integrate(
                     denoise_step_partial_call if noise_at_one else flipped_denoise_step_partial_call
                 ),
                 execution_horizon=execution_horizon,
+                **prefix_kwargs,
             )
             if not noise_at_one:
                 v_t = -v_t

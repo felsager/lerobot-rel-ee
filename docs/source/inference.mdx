@@ -361,6 +361,10 @@ use_torch_compile: true
 torch_compile_mode: default
 ```
 
+PI0/PI05 use native sampler compilation. Guided PI05 precomputes prefix weights
+with RTC debug tracking disabled, avoiding recompilation as the delay changes.
+Input shape or setting changes can still trigger compilation.
+
 Native PI0/PI05 constructors also receive the selected `torch_compile_mode`. These
 are local-inference settings; remote inference is configured on its server.
 

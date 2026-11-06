@@ -127,6 +127,7 @@ class RTCProcessor:
         time,
         original_denoise_step_partial,
         execution_horizon=None,
+        prefix_weights: Tensor | None = None,
     ) -> Tensor:
         """RTC guidance wrapper around an existing denoiser.
 
@@ -146,6 +147,8 @@ class RTCProcessor:
                 computes the base denoised velocity given only ``x_t``.
             execution_horizon (int | None): Horizon used to build prefix weights. If
                 ``None``, defaults to ``self.rtc_config.execution_horizon``.
+            prefix_weights (Tensor | None): Optional precomputed ``(T,)`` weights.
+                Lets callers keep delay-dependent construction outside a compiled sampler.
 
         Returns:
             Tensor: Guided velocity with the same shape as ``v_t``.
@@ -207,12 +210,11 @@ class RTCProcessor:
         if prev_chunk_left_over.shape != x_t.shape:
             raise ValueError("The padded previous chunk must be the same size as the input tensor")
 
-        weights = (
-            self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
-            .to(x_t.device)
-            .unsqueeze(0)
-            .unsqueeze(-1)
-        )
+        if prefix_weights is None:
+            prefix_weights = self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
+        elif prefix_weights.shape != (action_chunk_size,):
+            raise ValueError("Precomputed RTC prefix weights must match the action chunk length")
+        weights = prefix_weights.to(x_t.device).unsqueeze(0).unsqueeze(-1)
 
         v_t = original_denoise_step_partial(x_t)
 

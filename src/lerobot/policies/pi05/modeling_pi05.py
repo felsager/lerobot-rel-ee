@@ -943,6 +943,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         state_masks=None,
         noise=None,
         num_steps=None,
+        rtc_prefix_weights: Tensor | None = None,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
@@ -1017,6 +1018,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
+            rtc_prefix_weights=rtc_prefix_weights,
             hard_prefix=trained_prefix,
             hard_prefix_mask=trained_prefix_mask,
             precompute_times=self.precompute_denoise_times,
@@ -1552,9 +1554,39 @@ class PI05Policy(PreTrainedPolicy):
         states, state_masks = self._prepare_memory_states(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        # Build delay-dependent weights before entering the compiled sampler. The
+        # Python delay otherwise specializes sample_actions for every new value.
+        # Keep the original eager/debug/trained paths and their delay metadata.
+        rtc_prefix_weights = None
+        previous = kwargs.get("prev_chunk_left_over")
+        processor = self.rtc_processor
+        if (
+            self.config.compile_model
+            and self._rtc_enabled()
+            and processor is not None
+            and processor.rtc_config.mode == "guided"
+            and not processor.is_debug_enabled()
+            and previous is not None
+        ):
+            horizon = kwargs.get("execution_horizon")
+            if horizon is None:
+                horizon = processor.rtc_config.execution_horizon
+            horizon = min(horizon, previous.shape[-2])
+            rtc_prefix_weights = processor.get_prefix_weights(
+                kwargs.pop("inference_delay", None), horizon, self.config.chunk_size
+            ).to(device=tokens.device)
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(
-            images, img_masks, tokens, masks, states=states, state_masks=state_masks, noise=noise, **kwargs
+            images,
+            img_masks,
+            tokens,
+            masks,
+            states=states,
+            state_masks=state_masks,
+            noise=noise,
+            rtc_prefix_weights=rtc_prefix_weights,
+            **kwargs,
         )
 
         # Unpad actions to actual action dimension
