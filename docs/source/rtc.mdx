@@ -126,8 +126,6 @@ RTCConfig(execution_horizon=10)
 
 - `LINEAR`: Linear decay from inference_delay to execution_horizon
 - `EXP`: Exponential decay (recommended for getting started)
-- `ONES`: Full weight across entire execution_horizon
-- `ZEROS`: Binary (full weight up to inference_delay, then zero)
 
 **`inference_delay`**: How many timesteps of inference latency your system has. This is passed to `predict_action_chunk()` rather than the config, since it may vary at runtime.
 

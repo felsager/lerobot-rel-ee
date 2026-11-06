@@ -310,8 +310,6 @@ def test_pi0_rtc_validation_rules():
     set_seed(42)
 
     schedules = [
-        RTCAttentionSchedule.ZEROS,
-        RTCAttentionSchedule.ONES,
         RTCAttentionSchedule.LINEAR,
         RTCAttentionSchedule.EXP,
     ]

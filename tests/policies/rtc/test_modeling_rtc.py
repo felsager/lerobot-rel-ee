@@ -182,32 +182,6 @@ def test_reset_tracker_when_disabled(rtc_processor_debug_disabled):
 # ====================== get_prefix_weights Tests ======================
 
 
-def test_get_prefix_weights_zeros_schedule():
-    """Test get_prefix_weights with ZEROS schedule."""
-    config = RTCConfig(prefix_attention_schedule=RTCAttentionSchedule.ZEROS)
-    processor = RTCProcessor(config)
-
-    weights = processor.get_prefix_weights(start=5, end=10, total=20)
-
-    # First 5 should be 1.0, rest should be 0.0
-    assert weights.shape == (20,)
-    assert torch.all(weights[:5] == 1.0)
-    assert torch.all(weights[5:] == 0.0)
-
-
-def test_get_prefix_weights_ones_schedule():
-    """Test get_prefix_weights with ONES schedule."""
-    config = RTCConfig(prefix_attention_schedule=RTCAttentionSchedule.ONES)
-    processor = RTCProcessor(config)
-
-    weights = processor.get_prefix_weights(start=5, end=15, total=20)
-
-    # First 15 should be 1.0, rest should be 0.0
-    assert weights.shape == (20,)
-    assert torch.all(weights[:15] == 1.0)
-    assert torch.all(weights[15:] == 0.0)
-
-
 def test_get_prefix_weights_linear_schedule():
     """Test get_prefix_weights with LINEAR schedule."""
     config = RTCConfig(prefix_attention_schedule=RTCAttentionSchedule.LINEAR)
@@ -800,7 +774,7 @@ def test_denoise_step_deterministic_with_same_inputs():
 def test_guidance_correction_is_the_weighted_error_without_a_backward_pass(monkeypatch):
     """Guards the deliberate J = I: differentiating the denoiser here weakened real handoffs."""
     processor = RTCProcessor(
-        RTCConfig(debug=True, execution_horizon=2, prefix_attention_schedule=RTCAttentionSchedule.ONES)
+        RTCConfig(debug=True, execution_horizon=2, prefix_attention_schedule=RTCAttentionSchedule.EXP)
     )
     x = torch.tensor([[[0.3, -0.2], [0.1, 0.4]]])
     previous = torch.tensor([[[0.6, 0.2], [-0.1, 0.5]]])
@@ -814,7 +788,7 @@ def test_guidance_correction_is_the_weighted_error_without_a_backward_pass(monke
 
     monkeypatch.setattr(torch.autograd, "grad", unexpected_gradient)
     with torch.no_grad():
-        result = processor.denoise_step(x, previous, 1, 0.5, velocity)
+        result = processor.denoise_step(x, previous, 2, 0.5, velocity)
         error = previous - (x - 0.5 * x.sin())
     tracked = processor.get_all_debug_steps()[0]
     torch.testing.assert_close(tracked.correction, error, rtol=0, atol=0)
