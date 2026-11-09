@@ -912,6 +912,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         num_steps=None,
         rtc_prefix_weights: Tensor | None = None,
+        trained_prefix: Tensor | None = None,
+        trained_prefix_mask: Tensor | None = None,
         **kwargs: Unpack[RTCActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
@@ -951,14 +953,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
         rtc_mode = "guided"
-        trained_prefix = trained_prefix_mask = None
         if self._rtc_enabled():
             if self.rtc_processor is None:
                 raise ValueError(
                     "RTC is enabled in the config but PI05Pytorch was built without an RTCProcessor"
                 )
             rtc_mode = self.rtc_processor.rtc_config.mode
-            if rtc_mode == "trained":
+            if rtc_mode == "trained" and trained_prefix is None:
                 training_max_delay = int(getattr(self.config, "rtc_training_max_delay", 0))
                 if training_max_delay <= 0:
                     raise ValueError(
@@ -1545,6 +1546,17 @@ class PI05Policy(PreTrainedPolicy):
                 kwargs.pop("inference_delay", None), horizon, self.config.chunk_size
             ).to(device=tokens.device)
 
+        # Validate the trained prefix eagerly; inside the compiled sampler it graph-breaks.
+        trained_prefix = trained_prefix_mask = None
+        if self._rtc_enabled() and processor is not None and processor.rtc_config.mode == "trained":
+            shape = (tokens.shape[0], self.config.chunk_size, self.config.max_action_dim)
+            trained_prefix, trained_prefix_mask = _prepare_trained_rtc_prefix(
+                torch.empty(shape if noise is None else noise.shape, device=tokens.device),
+                previous,
+                int(kwargs.get("inference_delay") or 0),
+                self.config.rtc_training_max_delay,
+            )
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(
             images,
@@ -1555,6 +1567,8 @@ class PI05Policy(PreTrainedPolicy):
             state_masks=state_masks,
             noise=noise,
             rtc_prefix_weights=rtc_prefix_weights,
+            trained_prefix=trained_prefix,
+            trained_prefix_mask=trained_prefix_mask,
             **kwargs,
         )
 

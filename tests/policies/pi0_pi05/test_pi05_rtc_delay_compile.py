@@ -124,6 +124,7 @@ def test_sampler_keeps_delay_metadata_only_when_needed(path):
     policy = make_policy(compile_model=True, debug=path == "debug")
     if path == "trained":
         policy.rtc_processor.rtc_config.mode = "trained"
+        policy.config.rtc_training_max_delay = 10
     if path == "disabled":
         policy.rtc_processor.rtc_config.enabled = False
     calls = []
@@ -140,6 +141,7 @@ def test_sampler_keeps_delay_metadata_only_when_needed(path):
         inference_delay=4,
     )
     call = calls[0]
+    assert (call["trained_prefix"] is not None) == (path == "trained")
     if path != "guided":
         assert call["inference_delay"] == 4
         assert call["rtc_prefix_weights"] is None
