@@ -549,6 +549,23 @@ def test_euler_integrate_clamps_prefix_at_clean_end_of_forward_schedule():
     assert [time[0, 2].item() for time in seen_times] == [0.0, 0.5]
 
 
+@pytest.mark.parametrize("convention", list(FlowConvention))
+def test_euler_integrate_keeps_padded_action_dims_on_the_noise_path(convention):
+    noise = torch.randn(1, 4, 3, generator=torch.Generator().manual_seed(0))
+    seen = []
+
+    def denoise_fn(x_t, time_tensor):
+        seen.append((x_t[..., 2:].clone(), time_tensor[0].item()))
+        return torch.full_like(x_t, 100.0)
+
+    out = euler_integrate(denoise_fn, noise, 4, convention=convention, original_action_dim=2)
+
+    for padded, t in seen:
+        noise_weight = t if convention is FlowConvention.NOISE_AT_ONE else 1 - t
+        torch.testing.assert_close(padded, noise_weight * noise[..., 2:])
+    torch.testing.assert_close(out[..., 2:], torch.zeros(1, 4, 1))
+
+
 def test_euler_integrate_requires_prefix_mask_in_both_conventions():
     noise = torch.ones(1, 4, 1)
     for convention in FlowConvention:
