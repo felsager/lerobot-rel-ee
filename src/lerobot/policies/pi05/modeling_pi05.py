@@ -989,6 +989,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             rtc_prefix_weights=rtc_prefix_weights,
             hard_prefix=trained_prefix,
             hard_prefix_mask=trained_prefix_mask,
+            original_action_dim=self.config.output_features[ACTION].shape[0],
             precompute_times=self.precompute_denoise_times,
         )
 

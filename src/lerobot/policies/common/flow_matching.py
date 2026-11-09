@@ -270,6 +270,7 @@ def euler_integrate(
     rtc_prefix_weights: Tensor | None = None,
     hard_prefix: Tensor | None = None,
     hard_prefix_mask: Tensor | None = None,
+    original_action_dim: int | None = None,
     precompute_times: bool = False,
 ) -> Tensor:
     """Forward-Euler integration of a flow-matching velocity field between noise and actions.
@@ -315,6 +316,8 @@ def euler_integrate(
             Construct them before entering a compiled sampler to avoid specializing on delay.
         hard_prefix: Optional clean action prefix to clamp throughout denoising.
         hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
+        original_action_dim: Optional number of action dims before padding. The padded dims
+            are clamped to ``t * noise`` after each step.
         precompute_times: Retained for caller compatibility. Timestep values are now always
             precomputed once. Uniform values preserve historical Python float arithmetic in a
             float64 schedule; model inputs remain float32. Explicit grids retain their dtype.
@@ -353,7 +356,7 @@ def euler_integrate(
     schedule_device = torch.device("cpu") if device.type == "mps" else device
     schedule = (
         torch.tensor(
-            [uniform_time(step) for step in range(num_steps)],
+            [uniform_time(step) for step in range(num_steps)] + [clean_time],
             dtype=torch.float64,
             device=schedule_device,
         )
@@ -412,6 +415,10 @@ def euler_integrate(
         if velocity_scale is not None:
             update = update * velocity_scale
         x_t = x_t + update
+
+        if original_action_dim is not None:
+            t_next = schedule[step + 1] if noise_at_one else 1 - schedule[step + 1]
+            x_t[..., original_action_dim:] = t_next * noise[..., original_action_dim:]
 
         if hard_prefix is not None:
             x_t = torch.where(hard_prefix_mask, hard_prefix, x_t)
