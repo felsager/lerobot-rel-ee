@@ -70,8 +70,7 @@ class RTCConfig:
     mode: str = "guided"
 
     # Core RTC settings
-    # Todo change to exp
-    prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
+    prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.EXP
     max_guidance_weight: float = 10.0
     execution_horizon: int = 10
 
