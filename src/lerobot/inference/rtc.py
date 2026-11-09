@@ -23,13 +23,14 @@ import time
 import traceback
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from threading import Event, Lock, Thread
 from typing import Any
 
 import torch
 
 from lerobot.policies import ActionQueue, PreTrainedPolicy, RTCConfig, prepare_observation_for_inference
+from lerobot.policies.rtc.configuration_rtc import validate_trained_rtc_horizon
 from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
@@ -186,6 +187,7 @@ class RTCInferenceEngine(InferenceEngine):
         )
         self._runtime.queue.cfg = rtc_config
         self._reset_pending = False
+        self._pending_rtc_tuning: dict[str, Any] | None = None
         self._hold = HoldState()
         self._active_query_generation = 0
         for step in preprocessor.steps:
@@ -490,6 +492,47 @@ class RTCInferenceEngine(InferenceEngine):
         logger.info("Task changed: '%s' -> '%s'", previous, task)
         return True
 
+    @property
+    def rtc_tuning(self) -> dict[str, Any]:
+        """RTC settings and queue threshold, including an update the worker has not applied yet."""
+        with self._obs_lock:
+            pending = dict(self._pending_rtc_tuning or {})
+        return {**asdict(self._rtc_config), **pending, "queue_threshold": self._rtc_queue_threshold}
+
+    def update_rtc_tuning(self, *, queue_threshold: int, **rtc_fields: Any) -> None:
+        """Retune a paused engine between runs without restarting the worker.
+
+        The queue threshold applies now; it never enters compiled code. RTC fields apply on
+        the worker before its next model call, so no call mixes old and new settings. With
+        torch.compile, a changed field clears readiness until warmup runs again.
+        """
+        cfg, spec, steps = self._rtc_config, self._policy_spec, self._policy_spec.prediction_steps
+        tunable = {"execution_horizon", "max_guidance_weight", "prefix_attention_schedule"}
+        horizon = rtc_fields.get("execution_horizon", cfg.execution_horizon)
+        weight = rtc_fields.get("max_guidance_weight", cfg.max_guidance_weight)
+        if self._policy_active.is_set() or self.failed:
+            raise RuntimeError("RTC tuning requires a healthy paused engine")
+        if not set(rtc_fields) <= tunable:
+            raise ValueError(f"Only {sorted(tunable)} can change without a restart")
+        if not cfg.enabled or getattr(self._policy.config, "rtc_config", None) is not cfg:
+            raise RuntimeError("RTC tuning needs RTC enabled and one config shared with the policy")
+        if not 0 < horizon <= steps or not 0 <= queue_threshold <= steps:
+            raise ValueError(f"execution_horizon must be in 1..{steps} and queue_threshold in 0..{steps}")
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError("max_guidance_weight must be finite and positive")
+        if cfg.mode == "trained":
+            validate_trained_rtc_horizon(horizon, steps, spec.training_max_delay)
+            if queue_threshold < spec.training_max_delay:
+                raise ValueError("queue_threshold must cover rtc_training_max_delay")
+        changed = any(getattr(cfg, name) != value for name, value in rtc_fields.items())
+        with self._obs_lock, self._runtime.lock:
+            self._pending_rtc_tuning = rtc_fields
+            self._rtc_queue_threshold = queue_threshold
+            self._runtime.refill_seconds = queue_threshold / self._fps
+        if changed and self._use_torch_compile:
+            self._compile_warmup_done.clear()
+        self.reset()  # The worker applies the pending fields while handling this reset.
+
     def reset(self) -> None:
         """Reset policy, processors, action queue, and inference timing history.
 
@@ -670,8 +713,12 @@ class RTCInferenceEngine(InferenceEngine):
                 # Reset is ordered behind any model call already executing. The
                 # control thread has already revoked its old generation locally.
                 with self._obs_lock:
-                    reset_pending = self._reset_pending
-                    self._reset_pending = False
+                    reset_pending, tuning = self._reset_pending, self._pending_rtc_tuning
+                    self._reset_pending, self._pending_rtc_tuning = False, None
+                if tuning:
+                    with self._runtime.lock:
+                        for name, value in tuning.items():
+                            setattr(self._rtc_config, name, value)
                 if reset_pending:
                     warmup_previous = None
                     self._policy.reset()

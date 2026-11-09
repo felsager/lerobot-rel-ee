@@ -34,7 +34,7 @@ def test_preparation_finishes_while_paused_without_publication_or_extra_reads():
         engine._runtime.max_age = 0.5  # Allow the worker scheduling interval for the live test.
         engine.resume()
         observe(engine, 7.0)
-        assert wait_for(lambda: len(engine._policy.calls) == 4)
+        assert wait_for(lambda: len(engine._policy.action_observations) == 4)
         torch.testing.assert_close(engine._policy.action_observations[-1], torch.full((1, 2), 7.0))
         assert engine._policy.calls[-1][0] is None
     finally:
