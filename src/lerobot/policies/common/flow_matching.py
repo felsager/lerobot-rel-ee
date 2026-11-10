@@ -268,6 +268,7 @@ def euler_integrate(
     prev_chunk_left_over: Tensor | None = None,
     execution_horizon: int | None = None,
     rtc_prefix_weights: Tensor | None = None,
+    rtc_guidance_cap: Tensor | None = None,
     hard_prefix: Tensor | None = None,
     hard_prefix_mask: Tensor | None = None,
     original_action_dim: int | None = None,
@@ -314,6 +315,8 @@ def euler_integrate(
         execution_horizon: RTC guidance parameter, forwarded verbatim.
         rtc_prefix_weights: Optional precomputed RTC weights, forwarded to each guided step.
             Construct them before entering a compiled sampler to avoid specializing on delay.
+        rtc_guidance_cap: Optional ``max_guidance_weight`` tensor, forwarded to each guided step,
+            so a compiled sampler does not specialize on the weight.
         hard_prefix: Optional clean action prefix to clamp throughout denoising.
         hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
         original_action_dim: Optional number of action dims before padding. The padded dims
@@ -395,6 +398,8 @@ def euler_integrate(
 
         if guidance is not None:
             prefix_kwargs = {"prefix_weights": rtc_prefix_weights} if rtc_prefix_weights is not None else {}
+            if rtc_guidance_cap is not None:
+                prefix_kwargs["guidance_cap"] = rtc_guidance_cap
             v_t = guidance.denoise_step(
                 x_t=x_t,
                 prev_chunk_left_over=prev_chunk_left_over,

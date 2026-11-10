@@ -249,3 +249,47 @@ def test_compiled_sampler_follows_live_rtc_tuning():
             torch.testing.assert_close(run(policy, values), want, rtol=0, atol=0)
     finally:
         torch._dynamo.reset()
+
+
+def test_reloading_rtc_tuning_reuses_compiled_graphs():
+    """Horizon and weight reloads must not recompile, although the engine trims the prefix."""
+    noise = torch.randn((1, 50, 8), generator=torch.Generator().manual_seed(11))
+    previous = noise[:, :30].clone() * 0.5
+    eager = make_policy(compile_model=False, real_sampler=True)
+    policy = make_policy(compile_model=True, real_sampler=True)
+    graphs = []
+
+    def backend(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def run(model, horizon, weight, delay=4):
+        model.rtc_processor.rtc_config.execution_horizon = horizon
+        model.rtc_processor.rtc_config.max_guidance_weight = weight
+        prefix = previous[:, :horizon]  # As prepare_continuation fits it to the horizon.
+        return model.predict_action_chunk(
+            batch(), noise=noise, prev_chunk_left_over=prefix, inference_delay=delay
+        )
+
+    torch._dynamo.reset()
+    try:
+        policy.model.sample_actions = torch.compile(policy.model.sample_actions, backend=backend)
+        policy.predict_action_chunk(batch(), noise=noise, inference_delay=0)
+        for delay in (0, 1):
+            run(policy, 10, 10.0, delay)
+        warmed_graphs = len(graphs)
+        for horizon, weight in ((18, 10.0), (6, 2.0), (25, 0.5), (10, 15.0), (10, 10.0)):
+            torch.testing.assert_close(
+                run(policy, horizon, weight), run(eager, horizon, weight), rtol=0, atol=0
+            )
+            assert len(graphs) == warmed_graphs, f"New graph at horizon {horizon}, weight {weight}"
+    finally:
+        torch._dynamo.reset()
+
+
+def test_guidance_cap_tensor_is_reused_until_the_weight_changes():
+    processor = RTCProcessor(RTCConfig(max_guidance_weight=5.0))
+    cap = processor.guidance_cap("cpu")
+    assert processor.guidance_cap("cpu") is cap and cap.item() == 5.0
+    processor.rtc_config.max_guidance_weight = 7.5
+    assert processor.guidance_cap("cpu").item() == 7.5
