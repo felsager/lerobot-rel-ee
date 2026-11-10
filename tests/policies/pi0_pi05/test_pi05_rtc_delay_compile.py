@@ -251,8 +251,8 @@ def test_compiled_sampler_follows_live_rtc_tuning():
         torch._dynamo.reset()
 
 
-def test_reloading_rtc_tuning_reuses_compiled_graphs():
-    """Horizon and weight reloads must not recompile, although the engine trims the prefix."""
+def test_reloading_execution_horizon_reuses_compiled_graphs():
+    """Horizon reloads must not recompile, although the engine trims the prefix to the horizon."""
     noise = torch.randn((1, 50, 8), generator=torch.Generator().manual_seed(11))
     previous = noise[:, :30].clone() * 0.5
     eager = make_policy(compile_model=False, real_sampler=True)
@@ -278,18 +278,10 @@ def test_reloading_rtc_tuning_reuses_compiled_graphs():
         for delay in (0, 1):
             run(policy, 10, 10.0, delay)
         warmed_graphs = len(graphs)
-        for horizon, weight in ((18, 10.0), (6, 2.0), (25, 0.5), (10, 15.0), (10, 10.0)):
+        for horizon, weight in ((18, 10.0), (6, 10.0), (25, 10.0), (10, 10.0)):
             torch.testing.assert_close(
                 run(policy, horizon, weight), run(eager, horizon, weight), rtol=0, atol=0
             )
             assert len(graphs) == warmed_graphs, f"New graph at horizon {horizon}, weight {weight}"
     finally:
         torch._dynamo.reset()
-
-
-def test_guidance_cap_tensor_is_reused_until_the_weight_changes():
-    processor = RTCProcessor(RTCConfig(max_guidance_weight=5.0))
-    cap = processor.guidance_cap("cpu")
-    assert processor.guidance_cap("cpu") is cap and cap.item() == 5.0
-    processor.rtc_config.max_guidance_weight = 7.5
-    assert processor.guidance_cap("cpu").item() == 7.5

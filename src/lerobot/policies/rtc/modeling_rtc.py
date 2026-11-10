@@ -49,7 +49,6 @@ class RTCProcessor:
                 "rtc_training_max_delay > 0."
             )
         self.rtc_config = rtc_config
-        self._guidance_cap_key = self._guidance_cap = None
 
         self.tracker = None
 
@@ -94,18 +93,6 @@ class RTCProcessor:
                 **metadata,
             )
 
-    def guidance_cap(self, device) -> Tensor:
-        """``max_guidance_weight`` as a device tensor, rebuilt only when the value or device changes.
-
-        Passed into a compiled sampler, a reload changes a tensor value instead of a
-        constant baked into the graph, so it does not recompile.
-        """
-        key = (self.rtc_config.max_guidance_weight, torch.device(device))
-        if self._guidance_cap_key != key:
-            self._guidance_cap = torch.tensor(key[0], dtype=torch.get_default_dtype(), device=device)
-            self._guidance_cap_key = key
-        return self._guidance_cap
-
     def get_all_debug_steps(self) -> list:
         """Get all debug steps from tracker.
 
@@ -141,7 +128,6 @@ class RTCProcessor:
         original_denoise_step_partial,
         execution_horizon=None,
         prefix_weights: Tensor | None = None,
-        guidance_cap: Tensor | None = None,
     ) -> Tensor:
         """RTC guidance wrapper around an existing denoiser.
 
@@ -163,8 +149,6 @@ class RTCProcessor:
                 ``None``, defaults to ``self.rtc_config.execution_horizon``.
             prefix_weights (Tensor | None): Optional precomputed ``(T,)`` weights.
                 Lets callers keep delay-dependent construction outside a compiled sampler.
-            guidance_cap (Tensor | None): Optional scalar tensor replacing
-                ``max_guidance_weight``, so a compiled sampler does not specialize on it.
 
         Returns:
             Tensor: Guided velocity with the same shape as ``v_t``.
@@ -247,14 +231,12 @@ class RTCProcessor:
         # default tensor dtype. Preserve that boundary for float64 RTC times;
         # evaluating the complement in float32 first changes guidance weights.
         tau_tensor = torch.as_tensor(tau, dtype=torch.get_default_dtype(), device=x_t.device)
-        if guidance_cap is None:
-            guidance_cap = tau_tensor.new_tensor(self.rtc_config.max_guidance_weight)
+        max_guidance_weight = tau_tensor.new_tensor(self.rtc_config.max_guidance_weight)
         squared_one_minus_tau = (1 - tau_tensor) ** 2
         inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
-        # +inf becomes the dtype maximum and NaN (0 * inf at tau=1) becomes 0; the cap then
-        # clamps exactly as substituting the weight for +inf did, without a Python constant.
-        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor)
-        guidance_weight = torch.minimum(torch.nan_to_num(c * inv_r2), guidance_cap)
+        c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=self.rtc_config.max_guidance_weight)
+        guidance_weight = torch.nan_to_num(c * inv_r2, posinf=self.rtc_config.max_guidance_weight)
+        guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
 
         result = v_t - guidance_weight * correction
 

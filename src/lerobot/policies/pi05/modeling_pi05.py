@@ -912,7 +912,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         noise=None,
         num_steps=None,
         rtc_prefix_weights: Tensor | None = None,
-        rtc_guidance_cap: Tensor | None = None,
         trained_prefix: Tensor | None = None,
         trained_prefix_mask: Tensor | None = None,
         **kwargs: Unpack[RTCActionSelectKwargs],
@@ -989,7 +988,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
             rtc_prefix_weights=rtc_prefix_weights,
-            rtc_guidance_cap=rtc_guidance_cap,
             hard_prefix=trained_prefix,
             hard_prefix_mask=trained_prefix_mask,
             original_action_dim=self.config.output_features[ACTION].shape[0],
@@ -1529,7 +1527,7 @@ class PI05Policy(PreTrainedPolicy):
         # Build delay-dependent weights before entering the compiled sampler. The
         # Python delay otherwise specializes sample_actions for every new value.
         # Keep the original eager/debug/trained paths and their delay metadata.
-        rtc_prefix_weights = rtc_guidance_cap = None
+        rtc_prefix_weights = None
         previous = kwargs.get("prev_chunk_left_over")
         processor = self.rtc_processor
         if (
@@ -1547,7 +1545,6 @@ class PI05Policy(PreTrainedPolicy):
             rtc_prefix_weights = processor.get_prefix_weights(
                 kwargs.pop("inference_delay", None), horizon, self.config.chunk_size
             ).to(device=tokens.device)
-            rtc_guidance_cap = processor.guidance_cap(tokens.device)
             # Zero-pad as the guided step would, so the sampler's input shape is horizon-independent.
             kwargs["prev_chunk_left_over"] = F.pad(
                 previous, (0, 0, 0, self.config.chunk_size - previous.shape[-2])
@@ -1574,7 +1571,6 @@ class PI05Policy(PreTrainedPolicy):
             state_masks=state_masks,
             noise=noise,
             rtc_prefix_weights=rtc_prefix_weights,
-            rtc_guidance_cap=rtc_guidance_cap,
             trained_prefix=trained_prefix,
             trained_prefix_mask=trained_prefix_mask,
             **kwargs,
