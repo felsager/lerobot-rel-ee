@@ -89,6 +89,11 @@ class ActionQueue:
         self.last_index = 0
         self.cfg = cfg
 
+    @property
+    def cursor(self) -> int:
+        """Commits since the last clear: the next committed action takes this index."""
+        return self._cursor
+
     def get(self) -> Tensor | None:
         """Get the next action from the queue.
 

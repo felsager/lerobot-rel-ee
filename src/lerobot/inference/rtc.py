@@ -288,6 +288,11 @@ class RTCInferenceEngine(InferenceEngine):
         """The shared action queue between the RTC thread and the main loop."""
         return self._runtime.queue
 
+    def set_execution_observer(self, observer: Callable[[str, dict], None] | None) -> None:
+        """Receive accepted chunks and committed actions; see ``ChunkRuntime.observer``."""
+        with self._runtime.lock:
+            self._runtime.observer = observer
+
     def prepare_compilation(
         self, obs: dict, *, timeout_s: float, cancelled: Callable[[], bool] | None = None
     ) -> None:

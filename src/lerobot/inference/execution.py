@@ -21,6 +21,7 @@ motor tick, including ticks without a queue pop. All clocks here are client-loca
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections import deque
@@ -34,6 +35,8 @@ import torch
 from lerobot.policies import ActionQueue, QueueSnapshot, RTCConfig
 
 from .contracts import ActionChunk, ActionProvenance, ExecutionMode, ObservationSnapshot
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -214,6 +217,10 @@ class ChunkRuntime:
         self._last_anchor: tuple[int, float, int] | None = None
         self.wait_events: deque[dict] = deque(maxlen=128)
         self.last_accept: dict = {}
+        # Optional telemetry callback(event, data), called under the runtime lock with
+        # "chunk" after an accepted merge and "action" after each commit. Keep it cheap;
+        # its failures are logged and never affect execution.
+        self.observer: Callable[[str, dict], None] | None = None
 
     @property
     def turnaround(self) -> float:
@@ -511,6 +518,20 @@ class ChunkRuntime:
                     snapshot=request.continuation,
                 )
             self.last_accept["accepted"] = accepted
+            if accepted and self.observer is not None:
+                snapshot = self.queue.snapshot()
+                self._notify(
+                    "chunk",
+                    request_id=request.request_id,
+                    generation=request.generation,
+                    delay=request.delay,
+                    capture_time=request.observation.capture_time,
+                    submitted_at=request.submitted_at,
+                    accepted_at=now,
+                    trimmed_actions=self.last_accept.get("trimmed_actions", 0),
+                    cursor=snapshot.cursor,
+                    plan=snapshot.canonical_actions,
+                )
             if accepted and self.starvation_deadline is not None:
                 self.wait_events.append(
                     {"event": "resumed", "wait_s": now - (self.starvation_deadline - self.starvation_grace)}
@@ -519,6 +540,12 @@ class ChunkRuntime:
                 self._starvation_capture_after = None
                 self._starvation_request_deadline = None
             return accepted
+
+    def _notify(self, event: str, **data) -> None:
+        try:
+            self.observer(event, data)
+        except Exception:
+            logger.exception("Execution observer failed on %s; continuing", event)
 
     @staticmethod
     def _same_context(old: ActionProvenance, new: ActionProvenance) -> bool:
@@ -606,6 +633,8 @@ class ChunkRuntime:
                 return None
             self.current = provenance
             self.has_executed = True
+            if self.observer is not None:
+                self._notify("action", request_id=provenance.request_id, cursor=self.queue.cursor - 1)
             if not self.dispatch_allowed():
                 return None
             return action, provenance

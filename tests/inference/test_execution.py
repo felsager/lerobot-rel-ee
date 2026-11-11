@@ -253,3 +253,27 @@ def test_ordinary_hold_retains_latency_history():
     rt.invalidate(held=True)
     assert rt.turnaround == 0.25
     assert rt._completed == 2
+
+
+def test_observer_reports_accepted_plans_and_committed_actions_without_affecting_execution():
+    rt, clock = runtime(ExecutionMode.RTC_GUIDED)
+    events = []
+    rt.observer = lambda event, data: events.append((event, data))
+    first = rt.begin(observation(clock))
+    assert rt.accept(first, chunk(first), task_version=0)
+    assert rt.pop()[0].item() == 0
+    second = rt.begin(observation(clock))
+    clock.now += 0.15
+    assert rt.accept(second, chunk(second, offset=10), task_version=0)
+    kinds = [event for event, _ in events]
+    assert kinds == ["chunk", "action", "chunk"]
+    plan = events[2][1]
+    assert plan["request_id"] == second.request_id and plan["cursor"] == 1
+    assert plan["plan"][0].item() == 10  # Nothing committed during inference, so nothing trimmed.
+    assert events[1][1] == {"request_id": first.request_id, "cursor": 0}
+
+    def broken(event, data):
+        raise RuntimeError("telemetry bug")
+
+    rt.observer = broken
+    assert rt.pop()[0].item() == 10, "observer failures never change execution"
