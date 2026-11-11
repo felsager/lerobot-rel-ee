@@ -264,14 +264,26 @@ class _TinyPolicy(torch.nn.Module):
         return {f"model.{key}": value for key, value in state_dict.items()}
 
 
-@pytest.mark.parametrize("native", [True, False])
-def test_loader_converts_only_pi05_format_checkpoints(tmp_path, native):
+@pytest.mark.parametrize(("native", "map_location"), [(True, "cpu"), (True, "cuda"), (False, "cpu")])
+def test_loader_converts_only_pi05_format_checkpoints(tmp_path, monkeypatch, native, map_location):
     source = torch.nn.Linear(2, 2)
     prefix = "model." if native else ""
     checkpoint = tmp_path / "model.safetensors"
     save_file({f"{prefix}{key}": value for key, value in source.state_dict().items()}, str(checkpoint))
 
-    policy = FineARTVLAPolicy._load_as_safetensor(_TinyPolicy(), str(checkpoint), "cpu", strict=True)
+    if native:
+        import lerobot.policies.pretrained as pretrained
+
+        load_model = pretrained.load_model_as_safetensor
+
+        def load_from_cpu(model, filename, **kwargs):
+            # Staging on CUDA duplicates the model and can OOM before inference starts.
+            assert kwargs["device"] == "cpu"
+            return load_model(model, filename, **kwargs)
+
+        monkeypatch.setattr(pretrained, "load_model_as_safetensor", load_from_cpu)
+
+    policy = FineARTVLAPolicy._load_as_safetensor(_TinyPolicy(), str(checkpoint), map_location, strict=True)
 
     assert policy.converted is not native
     torch.testing.assert_close(policy.model.weight, source.weight)

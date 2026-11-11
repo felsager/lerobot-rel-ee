@@ -493,7 +493,7 @@ def build_rollout_context(
     logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
 
     torch_compile_active = cfg.use_torch_compile
-    if cfg.use_torch_compile and policy_config.type not in ("pi0", "pi05"):
+    if cfg.use_torch_compile and policy_config.type not in ("pi0", "pi05", "fineart_vla"):
         torch_compile_active = _wrap_predict_action_chunk_with_torch_compile(
             policy,
             backend=cfg.torch_compile_backend,

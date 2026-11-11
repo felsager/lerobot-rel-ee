@@ -31,7 +31,6 @@ from torch import Tensor, nn
 from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.optim.optimizers import OptimizerParams
 from lerobot.utils.constants import ACTION
-from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.import_utils import _peft_available, require_package
 
@@ -221,7 +220,11 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
     @classmethod
     def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
         missing_keys, unexpected_keys = load_model_as_safetensor(
-            model, model_file, strict=strict, device=resolve_safetensors_device(map_location)
+            # Stage checkpoint tensors on CPU to avoid a second full copy on the GPU.
+            model,
+            model_file,
+            strict=strict,
+            device="cpu",
         )
         log_model_loading_keys(missing_keys, unexpected_keys)
         return model

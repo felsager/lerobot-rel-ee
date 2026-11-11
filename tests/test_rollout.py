@@ -289,18 +289,24 @@ def test_rollout_applies_compile_options_before_policy_load(
     hardware.assert_not_called()
 
 
-@pytest.mark.parametrize("policy_type", ["pi0", "pi05", "act"])
+@pytest.mark.parametrize("policy_type", ["pi0", "pi05", "fineart_vla", "act"])
 def test_native_compilation_is_not_wrapped_again_before_hardware(
     monkeypatch: pytest.MonkeyPatch, policy_type: str
 ) -> None:
     import lerobot.rollout.context as rollout_context
     from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.policies.fineart_vla.configuration_fineart_vla import FineARTVLAConfig
     from lerobot.policies.pi0.configuration_pi0 import PI0Config
     from lerobot.policies.pi05.configuration_pi05 import PI05Config
     from lerobot.rollout import RolloutConfig
     from tests.mocks.mock_robot import MockRobotConfig
 
-    config_type = {"pi0": PI0Config, "pi05": PI05Config, "act": ACTConfig}[policy_type]
+    config_type = {
+        "pi0": PI0Config,
+        "pi05": PI05Config,
+        "fineart_vla": FineARTVLAConfig,
+        "act": ACTConfig,
+    }[policy_type]
     config = config_type(device="cpu", pretrained_path=Path("unused-checkpoint"))
     cfg = RolloutConfig(robot=MockRobotConfig(), policy=config, device="cpu", use_torch_compile=True)
     # Real policies inherit Module.type: it converts dtype and is not an identifier.
@@ -317,7 +323,7 @@ def test_native_compilation_is_not_wrapped_again_before_hardware(
     with torch._dynamo.config.patch(), pytest.raises(RuntimeError) as raised:
         rollout_context.build_rollout_context(cfg, threading.Event())
     assert raised.value is stop_before_hardware
-    if policy_type in ("pi0", "pi05"):
+    if policy_type in ("pi0", "pi05", "fineart_vla"):
         wrapper.assert_not_called()
         assert config.compile_model is True
     else:
