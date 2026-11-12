@@ -194,6 +194,23 @@ def test_create_raises_on_existing_directory(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("features", "use_videos"),
+    [({"bad/name": SIMPLE_FEATURES["state"]}, False), (VIDEO_FEATURES, False)],
+    ids=["invalid-name", "video-without-use-videos"],
+)
+def test_create_validation_failure_leaves_no_root(tmp_path, features, use_videos):
+    """A rejected create() must not leave a root that blocks both create and resume."""
+    root = tmp_path / "new"
+
+    with pytest.raises(ValueError):
+        LeRobotDatasetMetadata.create(
+            repo_id="test/invalid", fps=DEFAULT_FPS, features=features, root=root, use_videos=use_videos
+        )
+
+    assert not root.exists()
+
+
 def test_init_loads_existing_metadata(tmp_path, lerobot_dataset_metadata_factory, info_factory):
     """When metadata files exist on disk, __init__ loads them correctly."""
     root = tmp_path / "load_test"

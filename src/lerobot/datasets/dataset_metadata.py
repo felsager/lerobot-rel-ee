@@ -839,8 +839,6 @@ class LeRobotDatasetMetadata:
         obj._requested_root = Path(root) if root is not None else None
         obj.root = obj._requested_root if obj._requested_root is not None else HF_LEROBOT_HOME / repo_id
 
-        obj.root.mkdir(parents=True, exist_ok=False)
-
         features = {**deepcopy(features), **DEFAULT_FEATURES}
         _validate_feature_names(features)
 
@@ -862,6 +860,9 @@ class LeRobotDatasetMetadata:
                 f"Features contain video keys {obj.video_keys}, but 'use_videos' is set to False. "
                 "Either remove video features from the features dict, or set 'use_videos=True'."
             )
+        # Create the root only after validation: a root without meta/info.json can
+        # neither be resumed nor created again.
+        obj.root.mkdir(parents=True, exist_ok=False)
         write_info(obj.info, obj.root)
         obj.revision = None
         obj._pq_writer = None
