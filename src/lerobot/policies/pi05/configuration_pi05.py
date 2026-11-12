@@ -125,6 +125,9 @@ class PI05Config(PreTrainedConfig):
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
     optimizer_fused: bool | None = None
+    optimizer_vlm_lr_scale: float = (
+        1.0  # PaliGemma (vision tower, projector, language model) lr = optimizer_lr * this.
+    )
 
     # Scheduler settings: see openpi `CosineDecaySchedule`
     # Note: These will auto-scale if --steps < scheduler_decay_steps

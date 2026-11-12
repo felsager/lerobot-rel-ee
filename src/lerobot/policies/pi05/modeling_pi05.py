@@ -1286,8 +1286,20 @@ class PI05Policy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self):
+        scale = self.config.optimizer_vlm_lr_scale
+        if scale == 1.0:
+            return self.parameters()
+        # Two groups: the rest at optimizer_lr, PaliGemma at optimizer_lr * scale. The scheduler scales both
+        # groups by the same factor, so the ratio holds for the whole run. The logged `lr` is the first group's.
+        vlm, rest = [], []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                (vlm if name.startswith("model.paligemma_with_expert.paligemma.") else rest).append(param)
+        groups = [{"params": rest}]
+        if vlm:
+            groups.append({"params": vlm, "lr": self.config.optimizer_lr * scale})
+        return groups
 
     def reset(self):
         """Reset internal state at the shared boundary of a batched rollout.
