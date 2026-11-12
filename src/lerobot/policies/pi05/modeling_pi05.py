@@ -18,7 +18,7 @@ import builtins
 import logging
 from collections import deque
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Unpack, cast
 
@@ -1034,6 +1034,46 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return self.action_out_proj(suffix_out)
 
 
+_TORCH_INIT_FUNCTIONS = (
+    "uniform_",
+    "normal_",
+    "trunc_normal_",
+    "constant_",
+    "ones_",
+    "zeros_",
+    "eye_",
+    "dirac_",
+    "xavier_uniform_",
+    "xavier_normal_",
+    "kaiming_uniform_",
+    "kaiming_normal_",
+    "orthogonal_",
+    "sparse_",
+)
+
+
+@contextmanager
+def _skip_weight_init():
+    """Construct modules without random weight init; every weight must be loaded afterwards.
+
+    Unlike ``transformers``' ``no_init_weights`` this keeps ``tie_weights``. Buffers
+    computed in ``__init__`` (e.g. rotary ``inv_freq``) are unaffected.
+    """
+    from transformers import PreTrainedModel
+
+    originals = {name: getattr(nn.init, name) for name in _TORCH_INIT_FUNCTIONS}
+    original_initialize = PreTrainedModel.initialize_weights
+    try:
+        for name in _TORCH_INIT_FUNCTIONS:
+            setattr(nn.init, name, lambda tensor, *args, **kwargs: tensor)
+        PreTrainedModel.initialize_weights = lambda self: None
+        yield
+    finally:
+        for name, function in originals.items():
+            setattr(nn.init, name, function)
+        PreTrainedModel.initialize_weights = original_initialize
+
+
 class PI05Policy(PreTrainedPolicy):
     """PI05 Policy for LeRobot."""
 
@@ -1126,68 +1166,65 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
-        # Initialize model without loading weights
-        # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
-
-        # Load state dict (expects keys with "model." prefix)
+        print(f"Loading model from: {pretrained_name_or_path}")
         try:
-            print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
+            from transformers.utils import cached_file
 
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
+            resolved_file = cached_file(
+                pretrained_name_or_path,
+                "model.safetensors",
+                cache_dir=kwargs.get("cache_dir"),
+                force_download=kwargs.get("force_download", False),
+                resume_download=kwargs.get("resume_download"),
+                proxies=kwargs.get("proxies"),
+                token=kwargs.get("token"),
+                revision=kwargs.get("revision"),
+                local_files_only=kwargs.get("local_files_only", False),
+            )
+            from safetensors.torch import load_file
 
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
+            original_state_dict = load_file(resolved_file)
+            print("✓ Loaded state dict from model.safetensors")
+        except Exception as e:
+            print(f"Could not load state dict from remote files: {e}")
+            print("Returning model without loading pretrained weights")
+            return cls(config, **kwargs)
 
-            remapped_state_dict = model._convert_openpi_state_dict(original_state_dict)
+        # Random init is almost all of construction time (~50 s for pi05) and the
+        # checkpoint overwrites it, so build without it. Weights the checkpoint
+        # lacks (e.g. modules new to a base checkpoint) need their random init:
+        # rebuild normally in that case.
+        with _skip_weight_init():
+            model = cls(config, **kwargs)
+        loaded = model._load_openpi_state_dict(original_state_dict)
+        if loaded is None or loaded[0]:
+            del model
+            model = cls(config, **kwargs)
+            loaded = model._load_openpi_state_dict(original_state_dict)
+        if loaded is None:
+            return model
+        missing_keys, unexpected_keys = loaded
+        if strict and (missing_keys or unexpected_keys):
+            print("Warning: strict loading found missing or unexpected keys")
+        for label, keys in (("Missing", missing_keys), ("Unexpected", unexpected_keys)):
+            if keys:
+                print(f"{label} keys when loading state dict: {len(keys)} keys")
+                for key in keys[:5]:
+                    print(f"  - {key}")
+                if len(keys) > 5:
+                    print(f"  ... and {len(keys) - 5} more")
+        if not missing_keys and not unexpected_keys:
+            print("All keys loaded successfully!")
+        return model
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
-
-            if missing_keys:
-                print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
-                if len(missing_keys) <= 5:
-                    for key in missing_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in missing_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(missing_keys) - 5} more")
-
-            if unexpected_keys:
-                print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
-                if len(unexpected_keys) <= 5:
-                    for key in unexpected_keys:
-                        print(f"  - {key}")
-                else:
-                    for key in unexpected_keys[:5]:
-                        print(f"  - {key}")
-                    print(f"  ... and {len(unexpected_keys) - 5} more")
-
-            if not missing_keys and not unexpected_keys:
-                print("All keys loaded successfully!")
-
+    def _load_openpi_state_dict(self, state_dict: dict[str, Tensor]) -> tuple[list[str], list[str]] | None:
+        """Copy every matching weight; return (missing, unexpected) keys, or None on failure."""
+        try:
+            result = self.load_state_dict(self._convert_openpi_state_dict(state_dict), strict=False)
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
-
-        return model
+            return None
+        return result.missing_keys, result.unexpected_keys
 
     def _convert_openpi_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         """Map an OpenPI-format checkpoint (e.g. ``lerobot/pi05_base``) onto this policy's keys."""
