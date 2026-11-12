@@ -94,6 +94,8 @@ class PI05Config(PreTrainedConfig):
 
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
+    # Training only: mask each wrist camera (image key containing "wrist") with this probability per sample.
+    wrist_camera_dropout: float = 0.0
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
     text_tokenizer_name: str = "google/paligemma-3b-pt-224"

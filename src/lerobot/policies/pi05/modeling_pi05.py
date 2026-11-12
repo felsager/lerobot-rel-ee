@@ -1462,6 +1462,9 @@ class PI05Policy(PreTrainedPolicy):
             pad_key = f"{key}_is_pad"
             if is_video and pad_key in batch:
                 mask = mask & ~batch[pad_key].to(device=device, dtype=torch.bool)
+            if self.training and self.config.wrist_camera_dropout > 0 and "wrist" in key:
+                keep = torch.rand(bsize, device=device) >= self.config.wrist_camera_dropout
+                mask = mask & (keep[:, None] if is_video else keep)
             img_masks.append(mask)
 
         # Create image features not present in the batch as fully 0 padded images
