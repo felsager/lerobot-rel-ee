@@ -29,6 +29,8 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 """
 
 import dataclasses
+import importlib
+import importlib.util
 import logging
 import sys
 import time
@@ -134,6 +136,49 @@ def _ema_weights(ema: Any, policy: PreTrainedPolicy) -> Iterator[None]:
         yield
     finally:
         ema.restore(params)
+
+
+def _load_eval_hook(spec: str) -> Any:
+    """The function named by "path/to/file.py:function" or "package.module:function"."""
+    target, _, name = spec.rpartition(":")
+    if target.endswith(".py"):
+        module_spec = importlib.util.spec_from_file_location(target.rsplit("/", 1)[-1][:-3], target)
+        if module_spec is None or module_spec.loader is None:
+            raise FileNotFoundError(f"--eval_hook file not found: {target}")
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(target)
+    return getattr(module, name)
+
+
+def _is_eval_hook_step(step: int, cfg: TrainPipelineConfig) -> bool:
+    if cfg.eval_hook is None:
+        return False
+    return step == cfg.steps or (step % cfg.eval_hook_freq == 0 and step >= cfg.eval_hook_start * cfg.steps)
+
+
+def _run_eval_hook(hook: Any, policy: PreTrainedPolicy, ema: Any, preprocessor, postprocessor) -> dict:
+    """Metrics of the hook on the live (and EMA) weights, leaving the training RNG streams untouched."""
+    devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+    metrics = {}
+    policy.eval()
+    try:
+        for prefix, use_ema in (("", False), ("ema/", True))[: 1 + (ema is not None)]:
+            weights = _ema_weights(ema, policy) if use_ema else nullcontext()
+            # Eager: the compiled sampler would recompile for single-sample inference.
+            with (
+                weights,
+                torch.random.fork_rng(devices),
+                torch.no_grad(),
+                torch.compiler.set_stance("force_eager"),
+            ):
+                metrics |= {
+                    prefix + key: value for key, value in hook(policy, preprocessor, postprocessor).items()
+                }
+    finally:
+        policy.train()
+    return metrics
 
 
 @contextmanager
@@ -935,6 +980,9 @@ def train(cfg: TrainPipelineConfig) -> None:
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    # Loaded before training so a mistyped hook fails immediately rather than halfway through the run.
+    eval_hook = _load_eval_hook(cfg.eval_hook) if cfg.eval_hook and is_main_process() else None
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -1020,6 +1068,17 @@ def train(cfg: TrainPipelineConfig) -> None:
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+
+        if _is_eval_hook_step(step, cfg):
+            if is_main_process():
+                hook_start = time.perf_counter()
+                metrics = _run_eval_hook(
+                    eval_hook, accelerator.unwrap_model(policy), ema, preprocessor, postprocessor
+                )
+                logging.info(f"step {step}: eval hook ({time.perf_counter() - hook_start:.0f} s) {metrics}")
+                if wandb_logger:
+                    wandb_logger.log_dict(metrics, step=step, mode="eval")
+            accelerator.wait_for_everyone()
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file

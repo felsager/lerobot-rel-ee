@@ -148,6 +148,12 @@ class TrainPipelineConfig(HubMixin):
     eval_steps: int = 0
     # Cap on total eval samples, split uniformly across tasks (0 = use all held-out data).
     max_eval_samples: int = 0
+    # Call function(policy, preprocessor, postprocessor) -> dict[str, float] on the live policy every
+    # `eval_hook_freq` steps from `eval_hook_start` × steps on, and after the last step; its metrics are
+    # logged under eval/ (EMA weights too, under eval/ema/). "path/to/file.py:function" or "module:function".
+    eval_hook: str | None = None
+    eval_hook_freq: int = 2000
+    eval_hook_start: float = 0.5
     tolerance_s: float = 1e-4
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
@@ -337,6 +343,8 @@ class TrainPipelineConfig(HubMixin):
 
         if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
             raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+        if self.eval_hook is not None and (self.eval_hook_freq <= 0 or not 0 <= self.eval_hook_start <= 1):
+            raise ValueError("--eval_hook needs eval_hook_freq > 0 and 0 <= eval_hook_start <= 1.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.
