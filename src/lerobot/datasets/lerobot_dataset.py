@@ -969,17 +969,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         obj._depth_output_unit = DEFAULT_DEPTH_UNIT
         obj._batch_encoding_size = batch_encoding_size
 
-        if obj._requested_root is not None:
-            obj._requested_root.mkdir(exist_ok=True, parents=True)
+        created_root = not obj._requested_root.exists()
+        obj._requested_root.mkdir(exist_ok=True, parents=True)
 
         # Load metadata (revision-safe when root is not provided)
-        obj.meta = LeRobotDatasetMetadata(
-            obj.repo_id,
-            obj._requested_root,
-            obj.revision,
-            force_cache_sync=force_cache_sync,
-            token=token,
-        )
+        try:
+            obj.meta = LeRobotDatasetMetadata(
+                obj.repo_id,
+                obj._requested_root,
+                obj.revision,
+                force_cache_sync=force_cache_sync,
+                token=token,
+            )
+        except BaseException:
+            if created_root and not any(obj._requested_root.iterdir()):
+                obj._requested_root.rmdir()
+            raise
 
         obj._encoder_threads = encoder_threads
         obj._storage_root = None

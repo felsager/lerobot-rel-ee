@@ -496,6 +496,38 @@ def test_resume_freshly_created_empty_dataset(tmp_path):
     assert resumed.meta.episodes is None
 
 
+def test_failed_resume_of_missing_dataset_leaves_no_root(tmp_path, monkeypatch):
+    """A resume that finds no dataset must not leave a root that blocks create()."""
+
+    def repo_not_found(*args, **kwargs):
+        raise FileNotFoundError("repository not found")
+
+    monkeypatch.setattr(dataset_metadata_module, "get_safe_version", repo_not_found)
+    root = tmp_path / "missing_ds"
+
+    with pytest.raises(FileNotFoundError):
+        LeRobotDataset.resume(repo_id=DUMMY_REPO_ID, root=root)
+
+    assert not root.exists()
+    LeRobotDataset.create(repo_id=DUMMY_REPO_ID, fps=DEFAULT_FPS, features=SIMPLE_FEATURES, root=root)
+
+
+def test_failed_resume_keeps_existing_root(tmp_path, monkeypatch):
+    """Only a root that resume() created itself is removed."""
+
+    def repo_not_found(*args, **kwargs):
+        raise FileNotFoundError("repository not found")
+
+    monkeypatch.setattr(dataset_metadata_module, "get_safe_version", repo_not_found)
+    root = tmp_path / "existing_empty"
+    root.mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        LeRobotDataset.resume(repo_id=DUMMY_REPO_ID, root=root)
+
+    assert root.is_dir()
+
+
 def test_resume_creates_writer(tmp_path):
     """After resume(), writer is a DatasetWriter."""
     root = tmp_path / "resume_ds"
